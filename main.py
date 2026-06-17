@@ -153,8 +153,9 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
         .execute()
 
     if req.action == "start":
-        if shift_result.data:
-            raise HTTPException(status_code=400, detail="Смена уже начата")
+    active_shifts = [s for s in shift_result.data if s["status"] != "finished"]
+    if active_shifts:
+        raise HTTPException(status_code=400, detail="Смена уже начата")
         crew_result = supabase.table("crew_members").select("crew_id").eq("employee_id", employee["id"]).execute()
         if not crew_result.data:
             raise HTTPException(status_code=400, detail="Сотрудник не в экипаже")
