@@ -5,7 +5,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from geopy.distance import geodesic
 from datetime import datetime, date
-import os, uuid, hashlib, secrets
+import os, uuid, hashlib, secrets, httpx
 
 load_dotenv()
 
@@ -38,6 +38,27 @@ def get_current_employee(x_employee_id: str = Header(...)):
         raise HTTPException(status_code=401, detail="Не авторизован")
     return result.data[0]
 
+def get_address(lat: float, lng: float) -> str:
+    """Получаем адрес по координатам через Nominatim (OpenStreetMap)"""
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse"
+        params = {"lat": lat, "lon": lng, "format": "json", "accept-language": "ru"}
+        headers = {"User-Agent": "HardCollectionApp/1.0"}
+        r = httpx.get(url, params=params, headers=headers, timeout=5)
+        data = r.json()
+        addr = data.get("address", {})
+        parts = []
+        if addr.get("road"): parts.append(addr["road"])
+        if addr.get("house_number"): parts.append(addr["house_number"])
+        if addr.get("city") or addr.get("town") or addr.get("village"):
+            parts.append(addr.get("city") or addr.get("town") or addr.get("village"))
+        return ", ".join(parts) if parts else data.get("display_name", f"{lat:.4f}, {lng:.4f}")
+    except Exception:
+        return f"{lat:.4f}, {lng:.4f}"
+
+# Метки остановок по порядку
+STOP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
+
 # ─── АВТОРИЗАЦИЯ ─────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
@@ -53,7 +74,6 @@ def login(req: LoginRequest):
     if not result.data:
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
     emp = result.data[0]
-    # Получаем экипаж сотрудника
     crew_result = supabase.table("crew_members").select("*, crews(*)").eq("employee_id", emp["id"]).execute()
     crew = crew_result.data[0]["crews"] if crew_result.data else None
     return {"employee": emp, "crew": crew}
@@ -69,11 +89,10 @@ class CrewCreate(BaseModel):
     fuel_consumption_city: float
     fuel_consumption_highway: float
     color: str = "#3B82F6"
-    member_logins: list[str]  # список логинов сотрудников
+    member_logins: list[str]
 
 @app.post("/crews")
 def create_crew(req: CrewCreate):
-    # Создаём экипаж
     crew_data = {
         "name": req.name,
         "car_brand": req.car_brand,
@@ -86,7 +105,6 @@ def create_crew(req: CrewCreate):
     }
     crew = supabase.table("crews").insert(crew_data).execute().data[0]
 
-    # Создаём сотрудников с автологинами
     prefix = req.name.lower().replace(" ", "_")[:6]
     created_members = []
     for i, _ in enumerate(req.member_logins, 1):
@@ -128,7 +146,6 @@ class ShiftAction(BaseModel):
 def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     today = date.today().isoformat()
 
-    # Находим текущую смену
     shift_result = supabase.table("shifts")\
         .select("*")\
         .eq("employee_id", employee["id"])\
@@ -138,7 +155,6 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     if req.action == "start":
         if shift_result.data:
             raise HTTPException(status_code=400, detail="Смена уже начата")
-        # Получаем экипаж
         crew_result = supabase.table("crew_members").select("crew_id").eq("employee_id", employee["id"]).execute()
         if not crew_result.data:
             raise HTTPException(status_code=400, detail="Сотрудник не в экипаже")
@@ -191,6 +207,11 @@ class GpsPoint(BaseModel):
     lng: float
     speed: float = 0.0
 
+# Порог скорости (км/ч) ниже которого считаем остановкой
+STOP_SPEED_THRESHOLD = 5.0
+# Минимальное время остановки (секунд) чтобы записать точку
+STOP_MIN_SECONDS = 120
+
 @app.post("/gps/track")
 def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
     today = date.today().isoformat()
@@ -206,7 +227,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
 
     shift = shift_result.data[0]
 
-    # Сохраняем точку
+    # Сохраняем GPS точку
     supabase.table("gps_tracks").insert({
         "shift_id": shift["id"],
         "crew_id": shift["crew_id"],
@@ -216,7 +237,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
         "recorded_at": datetime.utcnow().isoformat()
     }).execute()
 
-    # Считаем пробег — расстояние от предыдущей точки
+    # Считаем пробег
     prev = supabase.table("gps_tracks")\
         .select("lat,lng")\
         .eq("shift_id", shift["id"])\
@@ -230,13 +251,10 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
         dist_km = geodesic(p1, p2).km
         new_km = float(shift.get("total_km") or 0) + dist_km
 
-        # Определяем тип дороги по скорости (>80 км/ч = трасса)
-        consumption = shift.get("crew_id")
         crew = supabase.table("crews").select("fuel_consumption_city,fuel_consumption_highway,fuel_type").eq("id", shift["crew_id"]).execute().data[0]
         rate = crew["fuel_consumption_highway"] if point.speed > 80 else crew["fuel_consumption_city"]
         fuel_used = float(shift.get("fuel_used") or 0) + (dist_km * rate / 100)
 
-        # Цена топлива
         price_result = supabase.table("fuel_prices")\
             .select("price_per_liter")\
             .eq("fuel_type", crew["fuel_type"])\
@@ -250,6 +268,71 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
             "fuel_used": round(fuel_used, 2),
             "fuel_cost": round(fuel_cost, 2)
         }).eq("id", shift["id"]).execute()
+
+    # ─── АВТООПРЕДЕЛЕНИЕ ОСТАНОВОК ───────────────────────────────
+    # Логика: если скорость < 5 км/ч — начало остановки.
+    # Берём последние 5 точек — если все медленные и прошло 2+ минуты,
+    # записываем точку остановки (если ещё не записана рядом).
+
+    if point.speed < STOP_SPEED_THRESHOLD:
+        recent = supabase.table("gps_tracks")\
+            .select("lat,lng,speed,recorded_at")\
+            .eq("shift_id", shift["id"])\
+            .order("recorded_at", desc=True)\
+            .limit(5)\
+            .execute().data
+
+        if len(recent) >= 3:
+            # Все последние точки медленные?
+            all_slow = all(float(p["speed"]) < STOP_SPEED_THRESHOLD for p in recent)
+
+            if all_slow:
+                first_slow_time = datetime.fromisoformat(recent[-1]["recorded_at"].replace("Z", "+00:00"))
+                last_slow_time = datetime.fromisoformat(recent[0]["recorded_at"].replace("Z", "+00:00"))
+                stopped_seconds = (last_slow_time - first_slow_time).total_seconds()
+
+                if stopped_seconds >= STOP_MIN_SECONDS:
+                    # Проверяем нет ли уже точки остановки рядом (в радиусе 100м за последние 30 мин)
+                    existing_stops = supabase.table("stop_points")\
+                        .select("lat,lng,arrived_at")\
+                        .eq("shift_id", shift["id"])\
+                        .order("arrived_at", desc=True)\
+                        .limit(1)\
+                        .execute().data
+
+                    should_record = True
+                    if existing_stops:
+                        last_stop = existing_stops[0]
+                        dist_from_last = geodesic(
+                            (last_stop["lat"], last_stop["lng"]),
+                            (point.lat, point.lng)
+                        ).meters
+                        last_stop_time = datetime.fromisoformat(last_stop["arrived_at"].replace("Z", "+00:00"))
+                        minutes_since_last = (last_slow_time - last_stop_time).total_seconds() / 60
+                        if dist_from_last < 100 and minutes_since_last < 30:
+                            should_record = False
+
+                    if should_record:
+                        # Определяем метку (A, B, C...)
+                        stop_count = supabase.table("stop_points")\
+                            .select("id")\
+                            .eq("shift_id", shift["id"])\
+                            .execute()
+                        label_idx = len(stop_count.data) % len(STOP_LABELS)
+                        label = STOP_LABELS[label_idx]
+
+                        # Получаем адрес
+                        address = get_address(point.lat, point.lng)
+
+                        supabase.table("stop_points").insert({
+                            "shift_id": shift["id"],
+                            "crew_id": shift["crew_id"],
+                            "lat": point.lat,
+                            "lng": point.lng,
+                            "address": address,
+                            "point_label": label,
+                            "arrived_at": first_slow_time.isoformat(),
+                        }).execute()
 
     return {"status": "ok"}
 
