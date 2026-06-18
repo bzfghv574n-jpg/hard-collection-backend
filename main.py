@@ -405,6 +405,49 @@ def get_fuel_prices():
     result = supabase.table("fuel_prices").select("*").order("valid_from", desc=True).execute()
     return result.data
 
+# ─── ДОБАВЛЕНИЕ ТОЧКИ ОСТАНОВКИ С МОБИЛКИ ────────────────────────
+
+class StopPoint(BaseModel):
+    lat: float
+    lng: float
+    address: str = ""
+    arrived_at: str  # ISO строка
+    duration_minutes: int = 0
+
+@app.post("/stops/add")
+def add_stop(req: StopPoint, employee=Depends(get_current_employee)):
+    today = date.today().isoformat()
+    shift_result = supabase.table("shifts")\
+        .select("*")\
+        .eq("employee_id", employee["id"])\
+        .eq("date", today)\
+        .in_("status", ["active", "break", "tech"])\
+        .execute()
+    if not shift_result.data:
+        raise HTTPException(status_code=400, detail="Нет активной смены")
+    shift = shift_result.data[0]
+
+    stop_count = supabase.table("stop_points")\
+        .select("id")\
+        .eq("shift_id", shift["id"])\
+        .execute()
+    label_idx = len(stop_count.data) % len(STOP_LABELS)
+    label = STOP_LABELS[label_idx]
+
+    address = req.address if req.address else get_address(req.lat, req.lng)
+
+    supabase.table("stop_points").insert({
+        "shift_id": shift["id"],
+        "crew_id": shift["crew_id"],
+        "lat": req.lat,
+        "lng": req.lng,
+        "address": address,
+        "point_label": label,
+        "arrived_at": req.arrived_at,
+        "duration_minutes": req.duration_minutes,
+    }).execute()
+    return {"status": "ok", "label": label}
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Hard Collection API"}
