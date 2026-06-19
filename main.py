@@ -137,9 +137,36 @@ def get_crew(crew_id: str):
 
 @app.delete("/crews/{crew_id}")
 def delete_crew(crew_id: str):
+    members = supabase.table("crew_members").select("employee_id").eq("crew_id", crew_id).execute().data
     supabase.table("crew_members").delete().eq("crew_id", crew_id).execute()
-    supabase.table("crews").update({"is_active": False}).eq("id", crew_id).execute()
-    return {"message": "Экипаж деактивирован"}
+    for m in members:
+        supabase.table("employees").delete().eq("id", m["employee_id"]).execute()
+    supabase.table("crews").delete().eq("id", crew_id).execute()
+    return {"message": "Экипаж удалён"}
+
+class CrewUpdate(BaseModel):
+    name: str
+    car_brand: str
+    car_model: str
+    engine_volume: float
+    fuel_type: str
+    fuel_consumption_city: float
+    fuel_consumption_highway: float
+    color: str = "#3B82F6"
+
+@app.put("/crews/{crew_id}")
+def update_crew(crew_id: str, req: CrewUpdate):
+    supabase.table("crews").update({
+        "name": req.name,
+        "car_brand": req.car_brand,
+        "car_model": req.car_model,
+        "engine_volume": req.engine_volume,
+        "fuel_type": req.fuel_type,
+        "fuel_consumption_city": req.fuel_consumption_city,
+        "fuel_consumption_highway": req.fuel_consumption_highway,
+        "color": req.color,
+    }).eq("id", crew_id).execute()
+    return {"message": "Экипаж обновлён"}
 
 @app.post("/employees/{employee_id}/reset-password")
 def reset_password(employee_id: str):
@@ -240,7 +267,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
     shift = shift_result.data[0]
 
     # Фильтруем GPS шум
-    if point.speed < 8:
+    if point.speed < 3:
         last_point = supabase.table("gps_tracks")\
             .select("lat,lng")\
             .eq("shift_id", shift["id"])\
@@ -251,7 +278,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
                 (last_point[0]["lat"], last_point[0]["lng"]),
                 (point.lat, point.lng)
             ).meters
-            if dist < 80:
+            if dist < 30:
                 return {"status": "ok"}
 
     supabase.table("gps_tracks").insert({
