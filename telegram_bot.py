@@ -290,7 +290,97 @@ async def check_long_stops(app):
                 )
                 await send_notification(app, msg, notif["id"])
 
-async def check_incomplete_crews(app):
+async def auto_finish_shifts(app):
+    """Автозавершение всех активных смен в 23:50"""
+    now = now_local()
+    today = now.date().isoformat()
+    crews = supabase.table("crews").select("*").eq("is_active", True).execute().data
+
+    for crew in crews:
+        active_shifts = supabase.table("shifts").select("*")            .eq("crew_id", crew["id"]).eq("date", today)            .in_("status", ["active", "break", "tech"]).execute().data
+
+        for shift in active_shifts:
+            try:
+                supabase.table("shifts").update({
+                    "status": "finished",
+                    "ended_at": datetime.utcnow().isoformat()
+                }).eq("id", shift["id"]).execute()
+                logger.info(f"Автозавершена смена {shift['id']} для экипажа {crew['name']}")
+            except Exception as e:
+                logger.error(f"Ошибка автозавершения: {e}")
+
+        if active_shifts:
+            # Считаем итоги
+            all_shifts = supabase.table("shifts").select("*")                .eq("crew_id", crew["id"]).eq("date", today).execute().data
+            total_km = sum(float(s.get("total_km") or 0) for s in all_shifts)
+            total_fuel = sum(float(s.get("fuel_used") or 0) for s in all_shifts)
+            total_cost = sum(float(s.get("fuel_cost") or 0) for s in all_shifts)
+            stops = supabase.table("stop_points").select("id").eq("crew_id", crew["id"]).execute().data
+
+            msg = (
+                f"🌙 *Смена автозавершена*
+
+"
+                f"Экипаж *«{crew['name']}»* — смена завершена автоматически в *23:50*
+
+"
+                f"📍 Точек посещено: *{len(stops)}*
+"
+                f"🛣 Пробег: *{total_km:.1f} км*
+"
+                f"⛽ Расход: *{total_fuel:.1f} л*
+"
+                f"💰 Стоимость топлива: *{total_cost:,.0f} ₸*"
+            )
+            await send_notification(app, msg)
+
+async def notify_shift_started(app):
+    """Уведомление когда экипаж начал смену"""
+    now = now_local()
+    today = now.date().isoformat()
+    crews = supabase.table("crews").select("*").eq("is_active", True).execute().data
+
+    for crew in crews:
+        # Ищем смены начатые за последние 6 минут
+        active_shifts = supabase.table("shifts").select("*")            .eq("crew_id", crew["id"]).eq("date", today)            .eq("status", "active").execute().data
+
+        for shift in active_shifts:
+            if not shift.get("started_at"):
+                continue
+            started_local = utc_to_local(shift["started_at"])
+            # Смена начата за последние 6 минут
+            minutes_ago = (now - started_local).total_seconds() / 60
+            if minutes_ago > 6:
+                continue
+
+            # Не отправляли ли уже уведомление о старте этой смены
+            existing = supabase.table("notifications").select("*")                .eq("crew_id", crew["id"]).eq("type", "shift_started")                .gte("created_at", today).execute()
+            # Проверяем нет ли уведомления за последние 10 минут
+            already_sent = False
+            if existing.data:
+                for notif in existing.data:
+                    notif_time = datetime.fromisoformat(notif["created_at"].replace("Z", "+00:00"))
+                    if (datetime.now(timezone.utc) - notif_time).total_seconds() < 600:
+                        already_sent = True
+                        break
+            if already_sent:
+                continue
+
+            supabase.table("notifications").insert({
+                "type": "shift_started",
+                "crew_id": crew["id"],
+                "message": f"Экипаж «{crew['name']}» начал смену"
+            }).execute()
+
+            msg = (
+                f"🟢 *Смена начата*
+
+"
+                f"Экипаж *«{crew['name']}»* вышел на линию в *{started_local.strftime('%H:%M')}*"
+            )
+            await send_notification(app, msg)
+
+async def check_incomplete_crews(app):async def check_incomplete_crews(app):
     now = now_local()
     today = now.date().isoformat()
     crews = supabase.table("crews").select("*, crew_members(*)").eq("is_active", True).execute().data
@@ -334,6 +424,10 @@ async def scheduler(app):
                 if now.hour == 9 and now.minute == 1 and now.weekday() < 6:
                     await check_shift_not_started(app)
 
+                # Уведомление о начале смены — каждые 5 минут
+                if now.minute % 5 == 0:
+                    await notify_shift_started(app)
+
                 # Итоги завершённых смен — каждые 5 минут
                 if now.minute % 5 == 0:
                     await check_shift_summary(app)
@@ -345,6 +439,10 @@ async def scheduler(app):
                 # Неполный состав — каждые 5 минут
                 if now.minute % 5 == 0:
                     await check_incomplete_crews(app)
+
+                # Автозавершение смен в 23:50
+                if now.hour == 23 and now.minute == 50:
+                    await auto_finish_shifts(app)
 
         except Exception as e:
             logger.error(f"Ошибка планировщика: {e}")
