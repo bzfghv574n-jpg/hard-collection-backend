@@ -240,7 +240,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
     shift = shift_result.data[0]
 
     # Фильтруем GPS шум
-    if point.speed < 3:
+    if point.speed < 5:
         last_point = supabase.table("gps_tracks")\
             .select("lat,lng")\
             .eq("shift_id", shift["id"])\
@@ -251,7 +251,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
                 (last_point[0]["lat"], last_point[0]["lng"]),
                 (point.lat, point.lng)
             ).meters
-            if dist < 30:
+            if dist < 50:
                 return {"status": "ok"}
 
     supabase.table("gps_tracks").insert({
