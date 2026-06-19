@@ -109,7 +109,7 @@ def create_crew(req: CrewCreate):
         password = generate_password()
         login = f"{prefix}_{i}"
         emp = supabase.table("employees").insert({
-            "full_name": f"Сотрудник {i} · {req.name}",
+            "full_name": req.member_logins[i-1] if req.member_logins[i-1] else f"Сотрудник {i} · {req.name}",
             "login": login,
             "password_hash": hash_password(password),
             "role": "agent"
