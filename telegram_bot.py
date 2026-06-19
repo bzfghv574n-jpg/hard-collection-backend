@@ -27,7 +27,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ *{full_name}*, вы подписаны на уведомления Hard Collection.\n\n"
             f"Вы будете получать:\n"
-            f"• 🔴 Смена не начата до 09:00\n"
+            f"• 🔴 Смена не начата до 09:01\n"
+            f"• 🏁 Смена завершена раньше 19:00\n"
             f"• 🛑 Экипаж без движения 60+ мин\n"
             f"• ⚠️ Неполный состав экипажа\n"
             f"• ✅ Итог завершённой смены",
@@ -103,6 +104,7 @@ async def send_notification(app, message: str, notification_id: str = None):
 # ─── ПРОВЕРКИ ────────────────────────────────────────────────────
 
 async def check_shift_not_started(app):
+    """Уведомление если смена не начата в 09:01"""
     now = datetime.now()
     if now.weekday() == 6:
         return
@@ -110,7 +112,8 @@ async def check_shift_not_started(app):
     crews = supabase.table("crews").select("*").eq("is_active", True).execute().data
     for crew in crews:
         shifts = supabase.table("shifts").select("*").eq("crew_id", crew["id"]).eq("date", today).execute().data
-        if not shifts:
+        active_shifts = [s for s in shifts if s["status"] != "finished"]
+        if not active_shifts:
             existing = supabase.table("notifications").select("*")\
                 .eq("crew_id", crew["id"]).eq("type", "no_shift").gte("created_at", today).execute()
             if not existing.data:
@@ -126,13 +129,72 @@ async def check_shift_not_started(app):
                 )
                 await send_notification(app, msg, notif["id"])
 
+async def check_early_finish(app):
+    """Уведомление если смена завершена до 19:00"""
+    now = datetime.now()
+    today = date.today().isoformat()
+    crews = supabase.table("crews").select("*").eq("is_active", True).execute().data
+
+    for crew in crews:
+        # Ищем смены завершённые сегодня
+        finished_shifts = supabase.table("shifts").select("*")\
+            .eq("crew_id", crew["id"]).eq("date", today)\
+            .eq("status", "finished").execute().data
+
+        if not finished_shifts:
+            continue
+
+        # Проверяем нет ли активных смен (если хоть одна активна — не уведомляем)
+        active_shifts = supabase.table("shifts").select("*")\
+            .eq("crew_id", crew["id"]).eq("date", today)\
+            .in_("status", ["active", "break", "tech"]).execute().data
+        if active_shifts:
+            continue
+
+        # Смотрим время завершения последней смены
+        for shift in finished_shifts:
+            if not shift.get("ended_at"):
+                continue
+            ended_at = datetime.fromisoformat(shift["ended_at"].replace("Z", "+00:00"))
+            # Переводим в локальное время (UTC+5 для Казахстана)
+            ended_local_hour = (ended_at.hour + 5) % 24
+
+            if ended_local_hour < 19:
+                # Завершили до 19:00 — проверяем не отправляли ли уже
+                existing = supabase.table("notifications").select("*")\
+                    .eq("crew_id", crew["id"]).eq("type", "early_finish")\
+                    .gte("created_at", today).execute()
+                if not existing.data:
+                    total_km = sum(float(s.get("total_km") or 0) for s in finished_shifts)
+                    total_fuel = sum(float(s.get("fuel_used") or 0) for s in finished_shifts)
+                    total_cost = sum(float(s.get("fuel_cost") or 0) for s in finished_shifts)
+                    stops = supabase.table("stop_points").select("id")\
+                        .eq("crew_id", crew["id"]).execute().data
+
+                    notif = supabase.table("notifications").insert({
+                        "type": "early_finish",
+                        "crew_id": crew["id"],
+                        "message": f"Экипаж «{crew['name']}» завершил смену до 19:00"
+                    }).execute().data[0]
+
+                    msg = (
+                        f"🏁 *Смена завершена раньше времени*\n\n"
+                        f"Экипаж *«{crew['name']}»* завершил смену в *{ended_local_hour:02d}:{ended_at.minute:02d}*\n"
+                        f"_(рабочий день до 19:00)_\n\n"
+                        f"📍 Точек посещено: *{len(stops)}*\n"
+                        f"🛣 Пробег: *{total_km:.1f} км*\n"
+                        f"⛽ Расход: *{total_fuel:.1f} л*\n"
+                        f"💰 Стоимость: *{total_cost:,.0f} ₸*"
+                    )
+                    await send_notification(app, msg, notif["id"])
+                break
+
 async def check_long_stops(app):
     """Уведомление если экипаж на одной точке 60+ минут"""
     today = date.today().isoformat()
     crews = supabase.table("crews").select("*").eq("is_active", True).execute().data
 
     for crew in crews:
-        # Проверяем только активные смены
         active_shifts = supabase.table("shifts").select("*")\
             .eq("crew_id", crew["id"]).eq("date", today)\
             .in_("status", ["active", "break", "tech"]).execute().data
@@ -143,22 +205,18 @@ async def check_long_stops(app):
             .select("lat,lng,speed,recorded_at")\
             .eq("crew_id", crew["id"])\
             .order("recorded_at", desc=True)\
-            .limit(20)\
-            .execute().data
+            .limit(20).execute().data
 
         if len(last_points) < 2:
             continue
 
-        # Время последней точки
         latest_time = datetime.fromisoformat(last_points[0]["recorded_at"].replace("Z", "+00:00"))
         now_utc = datetime.utcnow().replace(tzinfo=latest_time.tzinfo)
         minutes_since_last = (now_utc - latest_time).total_seconds() / 60
 
-        # Если последняя точка давно — экипаж офлайн, не спамим
         if minutes_since_last > 120:
             continue
 
-        # Смотрим точки за последний час — двигался ли экипаж
         one_hour_ago = now_utc.timestamp() - 3600
         recent_hour = [
             p for p in last_points
@@ -168,25 +226,18 @@ async def check_long_stops(app):
         if len(recent_hour) < 2:
             continue
 
-        # Общее смещение за час
         first = recent_hour[-1]
         last = recent_hour[0]
-        moved_meters = geodesic(
-            (first["lat"], first["lng"]),
-            (last["lat"], last["lng"])
-        ).meters
+        moved_meters = geodesic((first["lat"], first["lng"]), (last["lat"], last["lng"])).meters
 
         if moved_meters < 100:
-            # Стоит 60+ минут — отправляем уведомление (не чаще раза в 2 часа)
             existing = supabase.table("notifications").select("*")\
                 .eq("crew_id", crew["id"]).eq("type", "long_stop")\
                 .gte("created_at", today).execute()
 
             should_notify = True
             if existing.data:
-                last_notif_time = datetime.fromisoformat(
-                    existing.data[-1]["created_at"].replace("Z", "+00:00")
-                )
+                last_notif_time = datetime.fromisoformat(existing.data[-1]["created_at"].replace("Z", "+00:00"))
                 if (now_utc - last_notif_time).total_seconds() < 7200:
                     should_notify = False
 
@@ -238,14 +289,17 @@ async def scheduler(app):
     while True:
         try:
             now = datetime.now()
-            # Запускаем проверки только раз в минуту
             if now.minute != last_minute:
                 last_minute = now.minute
                 logger.info(f"Планировщик: {now.strftime('%H:%M')}")
 
-                # Незапущенные смены — в 09:05
-                if now.hour == 9 and now.minute == 5 and now.weekday() < 6:
+                # Незапущенные смены — в 09:01
+                if now.hour == 9 and now.minute == 1 and now.weekday() < 6:
                     await check_shift_not_started(app)
+
+                # Завершённые смены — каждые 5 минут весь день
+                if now.minute % 5 == 0:
+                    await check_early_finish(app)
 
                 # Долгие остановки — каждые 10 минут
                 if now.minute % 10 == 0:
