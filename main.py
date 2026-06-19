@@ -404,15 +404,14 @@ def get_live_dashboard():
         shifts = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew["id"]).eq("date", today).execute().data
         last_point = supabase.table("gps_tracks").select("lat,lng,recorded_at").eq("crew_id", crew["id"]).order("recorded_at", desc=True).limit(1).execute().data
         stops = supabase.table("stop_points").select("*").eq("crew_id", crew["id"]).order("arrived_at", desc=True).limit(1).execute().data
-        active_shifts = [s for s in shifts if s["status"] != "finished"] or shifts
         result.append({
             "crew": crew,
             "shifts": shifts,
             "last_position": last_point[0] if last_point else None,
             "current_stop": stops[0] if stops else None,
-            "total_km": sum(float(s.get("total_km") or 0) for s in active_shifts),
-            "total_fuel": sum(float(s.get("fuel_used") or 0) for s in active_shifts),
-            "total_cost": sum(float(s.get("fuel_cost") or 0) for s in active_shifts),
+            "total_km": sum(float(s.get("total_km") or 0) for s in shifts),
+            "total_fuel": sum(float(s.get("fuel_used") or 0) for s in shifts),
+            "total_cost": sum(float(s.get("fuel_cost") or 0) for s in shifts),
         })
     return result
 
