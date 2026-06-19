@@ -5,7 +5,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from geopy.distance import geodesic
 from datetime import datetime, date
-import os, uuid, hashlib, secrets, httpx
+import os, hashlib, secrets, httpx
 
 load_dotenv()
 
@@ -135,6 +135,20 @@ def get_crew(crew_id: str):
         raise HTTPException(status_code=404, detail="Экипаж не найден")
     return result.data[0]
 
+@app.delete("/crews/{crew_id}")
+def delete_crew(crew_id: str):
+    supabase.table("crew_members").delete().eq("crew_id", crew_id).execute()
+    supabase.table("crews").update({"is_active": False}).eq("id", crew_id).execute()
+    return {"message": "Экипаж деактивирован"}
+
+@app.post("/employees/{employee_id}/reset-password")
+def reset_password(employee_id: str):
+    new_password = generate_password()
+    supabase.table("employees").update({
+        "password_hash": hash_password(new_password)
+    }).eq("id", employee_id).execute()
+    return {"password": new_password}
+
 # ─── СМЕНЫ ───────────────────────────────────────────────────────
 
 class ShiftAction(BaseModel):
@@ -170,7 +184,6 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     if not shift_result.data:
         raise HTTPException(status_code=400, detail="Смена не найдена")
 
-    # Берём активную смену, не завершённую
     active = [s for s in shift_result.data if s["status"] != "finished"]
     if not active:
         raise HTTPException(status_code=400, detail="Нет активной смены")
@@ -211,9 +224,6 @@ class GpsPoint(BaseModel):
     lng: float
     speed: float = 0.0
 
-STOP_SPEED_THRESHOLD = 5.0
-STOP_MIN_SECONDS = 120
-
 @app.post("/gps/track")
 def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
     today = date.today().isoformat()
@@ -229,7 +239,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
 
     shift = shift_result.data[0]
 
-    # Фильтруем GPS шум — не записываем если стоим и слишком близко к предыдущей точке
+    # Фильтруем GPS шум
     if point.speed < 3:
         last_point = supabase.table("gps_tracks")\
             .select("lat,lng")\
@@ -242,9 +252,8 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
                 (point.lat, point.lng)
             ).meters
             if dist < 30:
-                return {"status": "ok"}  # Игнорируем шум
+                return {"status": "ok"}
 
-    # Сохраняем GPS точку
     supabase.table("gps_tracks").insert({
         "shift_id": shift["id"],
         "crew_id": shift["crew_id"],
@@ -254,7 +263,6 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
         "recorded_at": datetime.utcnow().isoformat()
     }).execute()
 
-    # Считаем пробег
     prev = supabase.table("gps_tracks")\
         .select("lat,lng")\
         .eq("shift_id", shift["id"])\
@@ -277,7 +285,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
             .eq("fuel_type", crew["fuel_type"])\
             .order("valid_from", desc=True)\
             .limit(1).execute()
-        price = price_result.data[0]["price_per_liter"] if price_result.data else 185
+        price = price_result.data[0]["price_per_liter"] if price_result.data else 245
         fuel_cost = fuel_used * float(price)
 
         supabase.table("shifts").update({
@@ -341,13 +349,9 @@ def add_stop(req: StopPoint, employee=Depends(get_current_employee)):
         raise HTTPException(status_code=400, detail="Нет активной смены")
     shift = shift_result.data[0]
 
-    stop_count = supabase.table("stop_points")\
-        .select("id")\
-        .eq("shift_id", shift["id"])\
-        .execute()
+    stop_count = supabase.table("stop_points").select("id").eq("shift_id", shift["id"]).execute()
     label_idx = len(stop_count.data) % len(STOP_LABELS)
     label = STOP_LABELS[label_idx]
-
     address = req.address if req.address else get_address(req.lat, req.lng)
 
     supabase.table("stop_points").insert({
@@ -373,7 +377,6 @@ def get_live_dashboard():
         shifts = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew["id"]).eq("date", today).execute().data
         last_point = supabase.table("gps_tracks").select("lat,lng,recorded_at").eq("crew_id", crew["id"]).order("recorded_at", desc=True).limit(1).execute().data
         stops = supabase.table("stop_points").select("*").eq("crew_id", crew["id"]).order("arrived_at", desc=True).limit(1).execute().data
-        # Берём только активные смены для подсчёта статистики
         active_shifts = [s for s in shifts if s["status"] != "finished"] or shifts
         result.append({
             "crew": crew,
