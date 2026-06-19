@@ -137,7 +137,12 @@ def get_crew(crew_id: str):
 
 @app.delete("/crews/{crew_id}")
 def delete_crew(crew_id: str):
+    # Получаем employee_id всех членов экипажа
+    members = supabase.table("crew_members").select("employee_id").eq("crew_id", crew_id).execute().data
     supabase.table("crew_members").delete().eq("crew_id", crew_id).execute()
+    # Удаляем сотрудников
+    for m in members:
+        supabase.table("employees").delete().eq("id", m["employee_id"]).execute()
     supabase.table("crews").update({"is_active": False}).eq("id", crew_id).execute()
     return {"message": "Экипаж деактивирован"}
 
