@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from geopy.distance import geodesic
 from datetime import datetime, date
 import os, hashlib, secrets, httpx
 
@@ -22,8 +21,6 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
-
-# ─── HELPERS ─────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -92,41 +89,32 @@ class CrewCreate(BaseModel):
 @app.post("/crews")
 def create_crew(req: CrewCreate):
     crew_data = {
-        "name": req.name,
-        "car_brand": req.car_brand,
-        "car_model": req.car_model,
-        "engine_volume": req.engine_volume,
-        "fuel_type": req.fuel_type,
+        "name": req.name, "car_brand": req.car_brand, "car_model": req.car_model,
+        "engine_volume": req.engine_volume, "fuel_type": req.fuel_type,
         "fuel_consumption_city": req.fuel_consumption_city,
-        "fuel_consumption_highway": req.fuel_consumption_highway,
-        "color": req.color,
+        "fuel_consumption_highway": req.fuel_consumption_highway, "color": req.color,
     }
     crew = supabase.table("crews").insert(crew_data).execute().data[0]
-
     prefix = req.name.lower().replace(" ", "_")[:6]
     created_members = []
     for i, _ in enumerate(req.member_logins, 1):
         password = generate_password()
-        login = f"{prefix}_{i}"
+        login_str = f"{prefix}_{i}"
         emp = supabase.table("employees").insert({
-            "full_name": req.member_logins[i-1] if req.member_logins[i-1] else f"Сотрудник {i} · {req.name}",
-            "login": login,
+            "full_name": req.member_logins[i-1] or f"Сотрудник {i}",
+            "login": login_str,
             "password_hash": hash_password(password),
             "role": "agent"
         }).execute().data[0]
         supabase.table("crew_members").insert({
-            "crew_id": crew["id"],
-            "employee_id": emp["id"],
-            "is_senior": i == 1
+            "crew_id": crew["id"], "employee_id": emp["id"], "is_senior": i == 1
         }).execute()
-        created_members.append({"login": login, "password": password, "employee_id": emp["id"]})
-
+        created_members.append({"login": login_str, "password": password, "employee_id": emp["id"]})
     return {"crew": crew, "members": created_members}
 
 @app.get("/crews")
 def get_crews():
-    crews = supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute()
-    return crews.data
+    return supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute().data
 
 @app.get("/crews/{crew_id}")
 def get_crew(crew_id: str):
@@ -157,23 +145,17 @@ class CrewUpdate(BaseModel):
 @app.put("/crews/{crew_id}")
 def update_crew(crew_id: str, req: CrewUpdate):
     supabase.table("crews").update({
-        "name": req.name,
-        "car_brand": req.car_brand,
-        "car_model": req.car_model,
-        "engine_volume": req.engine_volume,
-        "fuel_type": req.fuel_type,
+        "name": req.name, "car_brand": req.car_brand, "car_model": req.car_model,
+        "engine_volume": req.engine_volume, "fuel_type": req.fuel_type,
         "fuel_consumption_city": req.fuel_consumption_city,
-        "fuel_consumption_highway": req.fuel_consumption_highway,
-        "color": req.color,
+        "fuel_consumption_highway": req.fuel_consumption_highway, "color": req.color,
     }).eq("id", crew_id).execute()
     return {"message": "Экипаж обновлён"}
 
 @app.post("/employees/{employee_id}/reset-password")
 def reset_password(employee_id: str):
     new_password = generate_password()
-    supabase.table("employees").update({
-        "password_hash": hash_password(new_password)
-    }).eq("id", employee_id).execute()
+    supabase.table("employees").update({"password_hash": hash_password(new_password)}).eq("id", employee_id).execute()
     return {"password": new_password}
 
 # ─── СМЕНЫ ───────────────────────────────────────────────────────
@@ -184,12 +166,7 @@ class ShiftAction(BaseModel):
 @app.post("/shifts/action")
 def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     today = date.today().isoformat()
-
-    shift_result = supabase.table("shifts")\
-        .select("*")\
-        .eq("employee_id", employee["id"])\
-        .eq("date", today)\
-        .execute()
+    shift_result = supabase.table("shifts").select("*").eq("employee_id", employee["id"]).eq("date", today).execute()
 
     if req.action == "start":
         active_shifts = [s for s in shift_result.data if s["status"] != "finished"]
@@ -200,29 +177,19 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
             raise HTTPException(status_code=400, detail="Сотрудник не в экипаже")
         crew_id = crew_result.data[0]["crew_id"]
         shift = supabase.table("shifts").insert({
-            "employee_id": employee["id"],
-            "crew_id": crew_id,
-            "date": today,
-            "started_at": datetime.utcnow().isoformat(),
-            "status": "active"
+            "employee_id": employee["id"], "crew_id": crew_id, "date": today,
+            "started_at": datetime.utcnow().isoformat(), "status": "active"
         }).execute().data[0]
         return {"shift": shift, "message": "Смена начата"}
 
     if not shift_result.data:
         raise HTTPException(status_code=400, detail="Смена не найдена")
-
     active = [s for s in shift_result.data if s["status"] != "finished"]
     if not active:
         raise HTTPException(status_code=400, detail="Нет активной смены")
     shift = active[0]
-    shift_id = shift["id"]
 
-    status_map = {
-        "pause_break": "break",
-        "pause_tech": "tech",
-        "resume": "active",
-        "end": "finished"
-    }
+    status_map = {"pause_break": "break", "pause_tech": "tech", "resume": "active", "end": "finished"}
     new_status = status_map.get(req.action)
     if not new_status:
         raise HTTPException(status_code=400, detail="Неизвестное действие")
@@ -230,115 +197,122 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     update_data = {"status": new_status}
     if req.action == "end":
         update_data["ended_at"] = datetime.utcnow().isoformat()
-
-    supabase.table("shifts").update(update_data).eq("id", shift_id).execute()
+    supabase.table("shifts").update(update_data).eq("id", shift["id"]).execute()
     return {"message": f"Статус обновлён: {new_status}"}
 
 @app.get("/shifts/today/{crew_id}")
 def get_today_shifts(crew_id: str):
     today = date.today().isoformat()
-    result = supabase.table("shifts")\
-        .select("*, employees(full_name)")\
-        .eq("crew_id", crew_id)\
-        .eq("date", today)\
-        .execute()
+    result = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew_id).eq("date", today).execute()
     return result.data
 
 # ─── GPS ТРЕКИ ───────────────────────────────────────────────────
+# Вся логика фильтрации и пробега на мобилке.
+# Бэкенд просто сохраняет точку и прибавляет distance_km.
 
 class GpsPoint(BaseModel):
     lat: float
     lng: float
     speed: float = 0.0
+    distance_km: float = 0.0  # считается на мобилке, только при speed >= 15 км/ч
 
 @app.post("/gps/track")
 def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
     today = date.today().isoformat()
-    shift_result = supabase.table("shifts")\
-        .select("*")\
-        .eq("employee_id", employee["id"])\
-        .eq("date", today)\
-        .in_("status", ["active", "break", "tech"])\
-        .execute()
+    shift_result = supabase.table("shifts").select("*")\
+        .eq("employee_id", employee["id"]).eq("date", today)\
+        .in_("status", ["active", "break", "tech"]).execute()
 
     if not shift_result.data:
         raise HTTPException(status_code=400, detail="Нет активной смены")
 
     shift = shift_result.data[0]
 
-    # Фильтруем GPS шум
-    if point.speed < 3:
-        last_point = supabase.table("gps_tracks")\
-            .select("lat,lng")\
-            .eq("shift_id", shift["id"])\
-            .order("recorded_at", desc=True)\
-            .limit(1).execute().data
-        if last_point:
-            dist = geodesic(
-                (last_point[0]["lat"], last_point[0]["lng"]),
-                (point.lat, point.lng)
-            ).meters
-            if dist < 30:
-                return {"status": "ok"}
-
+    # Сохраняем точку
     supabase.table("gps_tracks").insert({
-        "shift_id": shift["id"],
-        "crew_id": shift["crew_id"],
-        "lat": point.lat,
-        "lng": point.lng,
-        "speed": point.speed,
+        "shift_id": shift["id"], "crew_id": shift["crew_id"],
+        "lat": point.lat, "lng": point.lng, "speed": point.speed,
         "recorded_at": datetime.utcnow().isoformat()
     }).execute()
 
-    prev = supabase.table("gps_tracks")\
-        .select("lat,lng")\
-        .eq("shift_id", shift["id"])\
-        .order("recorded_at", desc=True)\
-        .limit(2)\
-        .execute()
+    # Обновляем пробег только если мобилка прислала реальное расстояние
+    if point.distance_km > 0:
+        new_km = float(shift.get("total_km") or 0) + point.distance_km
+        crew = supabase.table("crews").select(
+            "fuel_consumption_city,fuel_consumption_highway,fuel_type"
+        ).eq("id", shift["crew_id"]).execute().data[0]
 
-    if len(prev.data) == 2:
-        p1 = (prev.data[1]["lat"], prev.data[1]["lng"])
-        p2 = (prev.data[0]["lat"], prev.data[0]["lng"])
-        dist_km = geodesic(p1, p2).km
-        new_km = float(shift.get("total_km") or 0) + dist_km
-
-        crew = supabase.table("crews").select("fuel_consumption_city,fuel_consumption_highway,fuel_type").eq("id", shift["crew_id"]).execute().data[0]
+        # Расход: трасса если > 80 км/ч, иначе город
         rate = crew["fuel_consumption_highway"] if point.speed > 80 else crew["fuel_consumption_city"]
-        fuel_used = float(shift.get("fuel_used") or 0) + (dist_km * rate / 100)
+        fuel_used = float(shift.get("fuel_used") or 0) + (point.distance_km * rate / 100)
 
-        price_result = supabase.table("fuel_prices")\
-            .select("price_per_liter")\
-            .eq("fuel_type", crew["fuel_type"])\
-            .order("valid_from", desc=True)\
-            .limit(1).execute()
-        price = price_result.data[0]["price_per_liter"] if price_result.data else 245
-        fuel_cost = fuel_used * float(price)
+        price_result = supabase.table("fuel_prices").select("price_per_liter")\
+            .eq("fuel_type", crew["fuel_type"]).order("valid_from", desc=True).limit(1).execute()
+        price = float(price_result.data[0]["price_per_liter"]) if price_result.data else 245.0
+        fuel_cost = fuel_used * price
 
         supabase.table("shifts").update({
-            "total_km": round(new_km, 2),
-            "fuel_used": round(fuel_used, 2),
+            "total_km": round(new_km, 3),
+            "fuel_used": round(fuel_used, 3),
             "fuel_cost": round(fuel_cost, 2)
         }).eq("id", shift["id"]).execute()
 
     return {"status": "ok"}
 
+@app.post("/gps/batch")
+def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)):
+    """Батч-эндпоинт для отправки накопленных офлайн точек"""
+    today = date.today().isoformat()
+    shift_result = supabase.table("shifts").select("*")\
+        .eq("employee_id", employee["id"]).eq("date", today)\
+        .in_("status", ["active", "break", "tech"]).execute()
+
+    if not shift_result.data:
+        raise HTTPException(status_code=400, detail="Нет активной смены")
+
+    shift = shift_result.data[0]
+    total_dist = 0.0
+
+    rows = []
+    for point in points:
+        rows.append({
+            "shift_id": shift["id"], "crew_id": shift["crew_id"],
+            "lat": point.lat, "lng": point.lng, "speed": point.speed,
+            "recorded_at": datetime.utcnow().isoformat()
+        })
+        if point.distance_km > 0:
+            total_dist += point.distance_km
+
+    if rows:
+        supabase.table("gps_tracks").insert(rows).execute()
+
+    if total_dist > 0:
+        new_km = float(shift.get("total_km") or 0) + total_dist
+        crew = supabase.table("crews").select(
+            "fuel_consumption_city,fuel_consumption_highway,fuel_type"
+        ).eq("id", shift["crew_id"]).execute().data[0]
+        rate = crew["fuel_consumption_city"]
+        fuel_used = float(shift.get("fuel_used") or 0) + (total_dist * rate / 100)
+        price_result = supabase.table("fuel_prices").select("price_per_liter")\
+            .eq("fuel_type", crew["fuel_type"]).order("valid_from", desc=True).limit(1).execute()
+        price = float(price_result.data[0]["price_per_liter"]) if price_result.data else 245.0
+        fuel_cost = fuel_used * price
+        supabase.table("shifts").update({
+            "total_km": round(new_km, 3),
+            "fuel_used": round(fuel_used, 3),
+            "fuel_cost": round(fuel_cost, 2)
+        }).eq("id", shift["id"]).execute()
+
+    return {"status": "ok", "saved": len(rows)}
+
 @app.get("/gps/track/{crew_id}")
 def get_crew_track(crew_id: str, shift_date: str = None):
     target_date = shift_date or date.today().isoformat()
-    shift = supabase.table("shifts")\
-        .select("id")\
-        .eq("crew_id", crew_id)\
-        .eq("date", target_date)\
-        .limit(1).execute()
+    shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
     if not shift.data:
         return []
-    shift_id = shift.data[0]["id"]
-    tracks = supabase.table("gps_tracks")\
-        .select("lat,lng,speed,recorded_at")\
-        .eq("shift_id", shift_id)\
-        .order("recorded_at")\
-        .execute()
+    tracks = supabase.table("gps_tracks").select("lat,lng,speed,recorded_at")\
+        .eq("shift_id", shift.data[0]["id"]).order("recorded_at").execute()
     return tracks.data
 
 # ─── ТОЧКИ ОСТАНОВОК ─────────────────────────────────────────────
@@ -349,11 +323,8 @@ def get_stops(crew_id: str, shift_date: str = None):
     shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
     if not shift.data:
         return []
-    stops = supabase.table("stop_points")\
-        .select("*")\
-        .eq("shift_id", shift.data[0]["id"])\
-        .order("arrived_at")\
-        .execute()
+    stops = supabase.table("stop_points").select("*")\
+        .eq("shift_id", shift.data[0]["id"]).order("arrived_at").execute()
     return stops.data
 
 class StopPoint(BaseModel):
@@ -366,29 +337,21 @@ class StopPoint(BaseModel):
 @app.post("/stops/add")
 def add_stop(req: StopPoint, employee=Depends(get_current_employee)):
     today = date.today().isoformat()
-    shift_result = supabase.table("shifts")\
-        .select("*")\
-        .eq("employee_id", employee["id"])\
-        .eq("date", today)\
-        .in_("status", ["active", "break", "tech"])\
-        .execute()
+    shift_result = supabase.table("shifts").select("*")\
+        .eq("employee_id", employee["id"]).eq("date", today)\
+        .in_("status", ["active", "break", "tech"]).execute()
     if not shift_result.data:
         raise HTTPException(status_code=400, detail="Нет активной смены")
     shift = shift_result.data[0]
 
     stop_count = supabase.table("stop_points").select("id").eq("shift_id", shift["id"]).execute()
-    label_idx = len(stop_count.data) % len(STOP_LABELS)
-    label = STOP_LABELS[label_idx]
+    label = STOP_LABELS[len(stop_count.data) % len(STOP_LABELS)]
     address = req.address if req.address else get_address(req.lat, req.lng)
 
     supabase.table("stop_points").insert({
-        "shift_id": shift["id"],
-        "crew_id": shift["crew_id"],
-        "lat": req.lat,
-        "lng": req.lng,
-        "address": address,
-        "point_label": label,
-        "arrived_at": req.arrived_at,
+        "shift_id": shift["id"], "crew_id": shift["crew_id"],
+        "lat": req.lat, "lng": req.lng, "address": address,
+        "point_label": label, "arrived_at": req.arrived_at,
         "duration_minutes": req.duration_minutes,
     }).execute()
     return {"status": "ok", "label": label}
@@ -405,8 +368,7 @@ def get_live_dashboard():
         last_point = supabase.table("gps_tracks").select("lat,lng,recorded_at").eq("crew_id", crew["id"]).order("recorded_at", desc=True).limit(1).execute().data
         stops = supabase.table("stop_points").select("*").eq("crew_id", crew["id"]).order("arrived_at", desc=True).limit(1).execute().data
         result.append({
-            "crew": crew,
-            "shifts": shifts,
+            "crew": crew, "shifts": shifts,
             "last_position": last_point[0] if last_point else None,
             "current_stop": stops[0] if stops else None,
             "total_km": sum(float(s.get("total_km") or 0) for s in shifts),
@@ -419,11 +381,11 @@ def get_live_dashboard():
 
 @app.get("/reports/summary")
 def get_report(date_from: str, date_to: str, crew_id: str = None):
-    query = supabase.table("shifts").select("*, crews(name, car_brand, car_model), employees(full_name)").gte("date", date_from).lte("date", date_to)
+    query = supabase.table("shifts").select("*, crews(name, car_brand, car_model), employees(full_name)")\
+        .gte("date", date_from).lte("date", date_to)
     if crew_id:
         query = query.eq("crew_id", crew_id)
-    result = query.execute()
-    return result.data
+    return query.execute().data
 
 # ─── ЦЕНЫ ТОПЛИВА ────────────────────────────────────────────────
 
@@ -434,16 +396,14 @@ class FuelPriceUpdate(BaseModel):
 @app.post("/fuel-prices")
 def update_fuel_price(req: FuelPriceUpdate):
     supabase.table("fuel_prices").insert({
-        "fuel_type": req.fuel_type,
-        "price_per_liter": req.price_per_liter,
+        "fuel_type": req.fuel_type, "price_per_liter": req.price_per_liter,
         "valid_from": date.today().isoformat()
     }).execute()
     return {"message": "Цена обновлена"}
 
 @app.get("/fuel-prices")
 def get_fuel_prices():
-    result = supabase.table("fuel_prices").select("*").order("valid_from", desc=True).execute()
-    return result.data
+    return supabase.table("fuel_prices").select("*").order("valid_from", desc=True).execute().data
 
 @app.get("/")
 def root():
