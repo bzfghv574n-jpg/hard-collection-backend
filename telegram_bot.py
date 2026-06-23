@@ -277,6 +277,18 @@ async def check_long_stops(app):
             .in_("status", ["active", "break", "tech"]).execute().data
         if not active_shifts:
             continue
+
+        # Не проверяем если смена началась менее 70 минут назад
+        earliest_start = min(
+            (s["started_at"] for s in active_shifts if s.get("started_at")),
+            default=None
+        )
+        if earliest_start:
+            started_utc = datetime.fromisoformat(earliest_start.replace("Z", "+00:00"))
+            minutes_since_start = (datetime.now(timezone.utc) - started_utc).total_seconds() / 60
+            if minutes_since_start < 70:
+                continue
+
         last_points = supabase.table("gps_tracks")\
             .select("lat,lng,speed,recorded_at")\
             .eq("crew_id", crew["id"])\
