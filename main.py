@@ -134,6 +134,20 @@ class CrewCreate(BaseModel):
     color: str = "#3B82F6"
     member_logins: list[str]
 
+def generate_unique_login(prefix: str, index: int) -> str:
+    # Экипажи архивируются, а не удаляются (см. delete_crew) — значит старые
+    # логины вида "prefix_1" остаются в базе навсегда, и при пересоздании
+    # экипажа с тем же названием они бы столкнулись с уникальным индексом
+    # на employees.login (500 Internal Server Error). Проверяем занятость
+    # и добавляем суффикс, пока не найдём свободный вариант.
+    base = f"{prefix}_{index}"
+    login_str = base
+    suffix = 1
+    while supabase.table("employees").select("id").eq("login", login_str).execute().data:
+        suffix += 1
+        login_str = f"{base}{suffix}"
+    return login_str
+
 @app.post("/crews")
 def create_crew(req: CrewCreate, admin=Depends(require_admin)):
     crew_data = {
@@ -147,7 +161,7 @@ def create_crew(req: CrewCreate, admin=Depends(require_admin)):
     created_members = []
     for i, _ in enumerate(req.member_logins, 1):
         password = generate_password()
-        login_str = f"{prefix}_{i}"
+        login_str = generate_unique_login(prefix, i)
         emp = supabase.table("employees").insert({
             "full_name": req.member_logins[i-1] or f"Сотрудник {i}",
             "login": login_str,
