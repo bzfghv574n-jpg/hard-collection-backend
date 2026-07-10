@@ -401,11 +401,16 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
 @app.get("/gps/track/{crew_id}")
 def get_crew_track(crew_id: str, shift_date: str = None, admin=Depends(require_admin)):
     target_date = shift_date or today_kz()
-    shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
-    if not shift.data:
+    # Экипаж может начать/закончить/начать смену заново в один день (пауза на
+    # обед и т.п.) — если брать только одну смену (.limit(1), без сортировки),
+    # можно тихо показать трек СТАРОЙ смены и потерять текущую. Объединяем
+    # точки со всех смен этого дня.
+    shifts = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).execute().data
+    if not shifts:
         return []
+    shift_ids = [s["id"] for s in shifts]
     tracks = supabase.table("gps_tracks").select("lat,lng,speed,recorded_at")\
-        .eq("shift_id", shift.data[0]["id"]).order("recorded_at").execute()
+        .in_("shift_id", shift_ids).order("recorded_at").execute()
     return tracks.data
 
 # ─── ТОЧКИ ОСТАНОВОК ─────────────────────────────────────────────
@@ -413,12 +418,14 @@ def get_crew_track(crew_id: str, shift_date: str = None, admin=Depends(require_a
 @app.get("/stops/{crew_id}")
 def get_stops(crew_id: str, shift_date: str = None):
     # Тоже вызывается мобилкой без заголовка авторизации (см. /shifts/today).
+    # Объединяем все смены дня — см. комментарий в get_crew_track.
     target_date = shift_date or today_kz()
-    shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
-    if not shift.data:
+    shifts = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).execute().data
+    if not shifts:
         return []
+    shift_ids = [s["id"] for s in shifts]
     stops = supabase.table("stop_points").select("*")\
-        .eq("shift_id", shift.data[0]["id"]).order("arrived_at").execute()
+        .in_("shift_id", shift_ids).order("arrived_at").execute()
     return stops.data
 
 class StopPoint(BaseModel):
