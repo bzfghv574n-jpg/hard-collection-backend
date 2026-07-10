@@ -175,16 +175,29 @@ def get_crew(crew_id: str, admin=Depends(require_admin)):
 
 @app.delete("/crews/{crew_id}")
 def delete_crew(crew_id: str, admin=Depends(require_admin)):
-    members = supabase.table("crew_members").select("employee_id").eq("crew_id", crew_id).execute().data
-    # Чистим всё, что ссылается на экипаж, иначе остаются висячие записи
-    supabase.table("gps_tracks").delete().eq("crew_id", crew_id).execute()
-    supabase.table("stop_points").delete().eq("crew_id", crew_id).execute()
-    supabase.table("shifts").delete().eq("crew_id", crew_id).execute()
+    # Архивируем, а не удаляем физически — иначе весь пробег/расход/GPS за
+    # прошлые смены этого экипажа пропал бы из отчётов навсегда. Экипаж с тем
+    # же названием можно пересоздать сразу же: create_crew всегда генерирует
+    # новый id, так что он не пересечётся с архивным.
+
+    # Принудительно завершаем смену, если она прямо сейчас активна —
+    # иначе она осталась бы "активной" навечно без возможности её закрыть.
+    supabase.table("shifts").update({
+        "status": "finished",
+        "ended_at": datetime.utcnow().isoformat()
+    }).eq("crew_id", crew_id).in_("status", ["active", "break", "tech"]).execute()
+
+    # Отвязываем сотрудников от экипажа — без этого /shifts/action("start")
+    # пустил бы их работать под уже архивным экипажем.
     supabase.table("crew_members").delete().eq("crew_id", crew_id).execute()
-    for m in members:
-        supabase.table("employees").delete().eq("id", m["employee_id"]).execute()
-    supabase.table("crews").delete().eq("id", crew_id).execute()
-    logger.info(f"Экипаж удалён: {crew_id} администратором {admin['id']}")
+
+    # Экипаж пропадает из /crews и /dashboard/live (там фильтр is_active=True),
+    # но сама запись и вся его история (shifts/gps_tracks/stop_points) остаются
+    # в базе — /reports/summary их не фильтрует по is_active, так что архивные
+    # экипажи по-прежнему видны в выгрузках за прошлые периоды.
+    supabase.table("crews").update({"is_active": False}).eq("id", crew_id).execute()
+
+    logger.info(f"Экипаж архивирован: {crew_id} администратором {admin['id']}")
     return {"message": "Экипаж удалён"}
 
 class CrewUpdate(BaseModel):
