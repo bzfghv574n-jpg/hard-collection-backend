@@ -1,7 +1,6 @@
 import asyncio
 import os
 import logging
-import httpx
 from datetime import datetime, date, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,12 +8,15 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from supabase import create_client, Client
 from geopy.distance import geodesic
 
+from geocoding import get_address
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_INVITE_CODE = os.getenv("TELEGRAM_INVITE_CODE")
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 TZ = timezone(timedelta(hours=5))
@@ -26,28 +28,18 @@ def utc_to_local(dt_str):
     dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     return dt.astimezone(TZ)
 
-def get_address(lat, lng):
-    try:
-        r = httpx.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={"lat": lat, "lon": lng, "format": "json", "accept-language": "ru"},
-            headers={"User-Agent": "HardCollectionBot/1.0"},
-            timeout=5
-        )
-        data = r.json()
-        addr = data.get("address", {})
-        parts = []
-        if addr.get("road"): parts.append(addr["road"])
-        if addr.get("house_number"): parts.append(addr["house_number"])
-        if addr.get("city") or addr.get("town") or addr.get("village"):
-            parts.append(addr.get("city") or addr.get("town") or addr.get("village"))
-        return ", ".join(parts) if parts else f"{lat:.4f}, {lng:.4f}"
-    except Exception:
-        return f"{lat:.4f}, {lng:.4f}"
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     full_name = update.effective_user.full_name
+
+    if TELEGRAM_INVITE_CODE:
+        provided = context.args[0] if context.args else None
+        if provided != TELEGRAM_INVITE_CODE:
+            await update.message.reply_text(
+                "Доступ по приглашению. Уточните ссылку-приглашение у администратора."
+            )
+            return
+
     existing = supabase.table("tg_subscribers").select("*").eq("chat_id", chat_id).execute()
     if not existing.data:
         supabase.table("tg_subscribers").insert({"chat_id": chat_id, "full_name": full_name}).execute()
@@ -70,7 +62,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Вы отписались от уведомлений.")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = date.today().isoformat()
+    today = now_local().date().isoformat()
     crews = supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute().data
     text = f"*Статус экипажей на {today}*\n\n"
     for crew in crews:

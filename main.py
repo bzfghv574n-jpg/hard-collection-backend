@@ -1,33 +1,76 @@
+import logging
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from datetime import datetime, date
-import os, hashlib, secrets, httpx
+from datetime import datetime, date, timezone, timedelta
+import os, hashlib, secrets
+
+from geocoding import get_address
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("hard_collection")
+
 app = FastAPI(title="Hard Collection API")
+
+# Дашборд и локальная разработка — единственные легитимные браузерные клиенты.
+# Мобильные приложения не отправляют Origin, так что CORS их не касается.
+ALLOWED_ORIGINS = [
+    "https://hard-collection-dashboard-production.up.railway.app",
+    "http://localhost:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
-)
+
+@app.middleware("http")
+async def log_unhandled_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception(f"Unhandled error on {request.method} {request.url.path}")
+        raise
+
+
+KZ_TZ = timezone(timedelta(hours=5))
+
+
+def today_kz() -> str:
+    """Календарная дата в казахстанском времени (+5), а не по UTC/времени сервера."""
+    return datetime.now(KZ_TZ).date().isoformat()
+
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
+
 def generate_password(length=8) -> str:
     chars = "abcdefghjkmnpqrstuvwxyz23456789"
     return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def safe_employee(emp: dict) -> dict:
+    """Убирает password_hash перед тем как отдать сотрудника клиенту."""
+    if not emp:
+        return emp
+    return {k: v for k, v in emp.items() if k != "password_hash"}
+
+
+def sanitize_crews(crews: list) -> list:
+    for crew in crews:
+        for cm in (crew.get("crew_members") or []):
+            if cm.get("employees"):
+                cm["employees"] = safe_employee(cm["employees"])
+    return crews
+
 
 def get_current_employee(x_employee_id: str = Header(...)):
     result = supabase.table("employees").select("*").eq("id", x_employee_id).execute()
@@ -35,24 +78,27 @@ def get_current_employee(x_employee_id: str = Header(...)):
         raise HTTPException(status_code=401, detail="Не авторизован")
     return result.data[0]
 
-def get_address(lat: float, lng: float) -> str:
-    try:
-        url = "https://nominatim.openstreetmap.org/reverse"
-        params = {"lat": lat, "lon": lng, "format": "json", "accept-language": "ru"}
-        headers = {"User-Agent": "HardCollectionApp/1.0"}
-        r = httpx.get(url, params=params, headers=headers, timeout=5)
-        data = r.json()
-        addr = data.get("address", {})
-        parts = []
-        if addr.get("road"): parts.append(addr["road"])
-        if addr.get("house_number"): parts.append(addr["house_number"])
-        if addr.get("city") or addr.get("town") or addr.get("village"):
-            parts.append(addr.get("city") or addr.get("town") or addr.get("village"))
-        return ", ".join(parts) if parts else data.get("display_name", f"{lat:.4f}, {lng:.4f}")
-    except Exception:
-        return f"{lat:.4f}, {lng:.4f}"
+
+def require_admin(employee=Depends(get_current_employee)):
+    if employee.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Требуются права администратора")
+    return employee
+
+
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
 
 STOP_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
+
+
+def stop_label(index: int) -> str:
+    """A..P, потом A2..P2, и т.д. — без повторов внутри одной смены."""
+    cycle, pos = divmod(index, len(STOP_LABELS))
+    letter = STOP_LABELS[pos]
+    return letter if cycle == 0 else f"{letter}{cycle + 1}"
+
 
 # ─── АВТОРИЗАЦИЯ ─────────────────────────────────────────────────
 
@@ -67,11 +113,13 @@ def login(req: LoginRequest):
         .eq("password_hash", hash_password(req.password))\
         .execute()
     if not result.data:
+        logger.info(f"Неудачная попытка входа: login={req.login}")
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
     emp = result.data[0]
     crew_result = supabase.table("crew_members").select("*, crews(*)").eq("employee_id", emp["id"]).execute()
     crew = crew_result.data[0]["crews"] if crew_result.data else None
-    return {"employee": emp, "crew": crew}
+    logger.info(f"Вход: employee_id={emp['id']} role={emp.get('role')}")
+    return {"employee": safe_employee(emp), "crew": crew}
 
 # ─── ЭКИПАЖИ ─────────────────────────────────────────────────────
 
@@ -87,7 +135,7 @@ class CrewCreate(BaseModel):
     member_logins: list[str]
 
 @app.post("/crews")
-def create_crew(req: CrewCreate):
+def create_crew(req: CrewCreate, admin=Depends(require_admin)):
     crew_data = {
         "name": req.name, "car_brand": req.car_brand, "car_model": req.car_model,
         "engine_volume": req.engine_volume, "fuel_type": req.fuel_type,
@@ -110,26 +158,33 @@ def create_crew(req: CrewCreate):
             "crew_id": crew["id"], "employee_id": emp["id"], "is_senior": i == 1
         }).execute()
         created_members.append({"login": login_str, "password": password, "employee_id": emp["id"]})
+    logger.info(f"Экипаж создан: {crew['id']} ({req.name}) администратором {admin['id']}")
     return {"crew": crew, "members": created_members}
 
 @app.get("/crews")
-def get_crews():
-    return supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute().data
+def get_crews(admin=Depends(require_admin)):
+    crews = supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute().data
+    return sanitize_crews(crews)
 
 @app.get("/crews/{crew_id}")
-def get_crew(crew_id: str):
+def get_crew(crew_id: str, admin=Depends(require_admin)):
     result = supabase.table("crews").select("*, crew_members(*, employees(*))").eq("id", crew_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Экипаж не найден")
-    return result.data[0]
+    return sanitize_crews(result.data)[0]
 
 @app.delete("/crews/{crew_id}")
-def delete_crew(crew_id: str):
+def delete_crew(crew_id: str, admin=Depends(require_admin)):
     members = supabase.table("crew_members").select("employee_id").eq("crew_id", crew_id).execute().data
+    # Чистим всё, что ссылается на экипаж, иначе остаются висячие записи
+    supabase.table("gps_tracks").delete().eq("crew_id", crew_id).execute()
+    supabase.table("stop_points").delete().eq("crew_id", crew_id).execute()
+    supabase.table("shifts").delete().eq("crew_id", crew_id).execute()
     supabase.table("crew_members").delete().eq("crew_id", crew_id).execute()
     for m in members:
         supabase.table("employees").delete().eq("id", m["employee_id"]).execute()
     supabase.table("crews").delete().eq("id", crew_id).execute()
+    logger.info(f"Экипаж удалён: {crew_id} администратором {admin['id']}")
     return {"message": "Экипаж удалён"}
 
 class CrewUpdate(BaseModel):
@@ -143,7 +198,7 @@ class CrewUpdate(BaseModel):
     color: str = "#3B82F6"
 
 @app.put("/crews/{crew_id}")
-def update_crew(crew_id: str, req: CrewUpdate):
+def update_crew(crew_id: str, req: CrewUpdate, admin=Depends(require_admin)):
     supabase.table("crews").update({
         "name": req.name, "car_brand": req.car_brand, "car_model": req.car_model,
         "engine_volume": req.engine_volume, "fuel_type": req.fuel_type,
@@ -153,9 +208,10 @@ def update_crew(crew_id: str, req: CrewUpdate):
     return {"message": "Экипаж обновлён"}
 
 @app.post("/employees/{employee_id}/reset-password")
-def reset_password(employee_id: str):
+def reset_password(employee_id: str, admin=Depends(require_admin)):
     new_password = generate_password()
     supabase.table("employees").update({"password_hash": hash_password(new_password)}).eq("id", employee_id).execute()
+    logger.info(f"Пароль сброшен: employee_id={employee_id} администратором {admin['id']}")
     return {"password": new_password}
 
 # ─── СМЕНЫ ───────────────────────────────────────────────────────
@@ -165,7 +221,7 @@ class ShiftAction(BaseModel):
 
 @app.post("/shifts/action")
 def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
-    today = date.today().isoformat()
+    today = today_kz()
     shift_result = supabase.table("shifts").select("*").eq("employee_id", employee["id"]).eq("date", today).execute()
 
     if req.action == "start":
@@ -201,8 +257,8 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     return {"message": f"Статус обновлён: {new_status}"}
 
 @app.get("/shifts/today/{crew_id}")
-def get_today_shifts(crew_id: str):
-    today = date.today().isoformat()
+def get_today_shifts(crew_id: str, admin=Depends(require_admin)):
+    today = today_kz()
     result = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew_id).eq("date", today).execute()
     return result.data
 
@@ -216,9 +272,13 @@ class GpsPoint(BaseModel):
     speed: float = 0.0
     distance_km: float = 0.0  # считается на мобилке, только при speed >= 15 км/ч
 
+def _fuel_rate_for(crew: dict, speed: float) -> float:
+    # Расход: трасса если > 80 км/ч, иначе город
+    return crew["fuel_consumption_highway"] if speed > 80 else crew["fuel_consumption_city"]
+
 @app.post("/gps/track")
 def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
-    today = date.today().isoformat()
+    today = today_kz()
     shift_result = supabase.table("shifts").select("*")\
         .eq("employee_id", employee["id"]).eq("date", today)\
         .in_("status", ["active", "break", "tech"]).execute()
@@ -242,8 +302,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
             "fuel_consumption_city,fuel_consumption_highway,fuel_type"
         ).eq("id", shift["crew_id"]).execute().data[0]
 
-        # Расход: трасса если > 80 км/ч, иначе город
-        rate = crew["fuel_consumption_highway"] if point.speed > 80 else crew["fuel_consumption_city"]
+        rate = _fuel_rate_for(crew, point.speed)
         fuel_used = float(shift.get("fuel_used") or 0) + (point.distance_km * rate / 100)
 
         price_result = supabase.table("fuel_prices").select("price_per_liter")\
@@ -262,7 +321,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
 @app.post("/gps/batch")
 def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)):
     """Батч-эндпоинт для отправки накопленных офлайн точек"""
-    today = date.today().isoformat()
+    today = today_kz()
     shift_result = supabase.table("shifts").select("*")\
         .eq("employee_id", employee["id"]).eq("date", today)\
         .in_("status", ["active", "break", "tech"]).execute()
@@ -272,6 +331,8 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
 
     shift = shift_result.data[0]
     total_dist = 0.0
+    total_fuel = 0.0
+    crew = None
 
     rows = []
     for point in points:
@@ -282,17 +343,19 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
         })
         if point.distance_km > 0:
             total_dist += point.distance_km
+            if crew is None:
+                crew = supabase.table("crews").select(
+                    "fuel_consumption_city,fuel_consumption_highway,fuel_type"
+                ).eq("id", shift["crew_id"]).execute().data[0]
+            rate = _fuel_rate_for(crew, point.speed)
+            total_fuel += point.distance_km * rate / 100
 
     if rows:
         supabase.table("gps_tracks").insert(rows).execute()
 
     if total_dist > 0:
         new_km = float(shift.get("total_km") or 0) + total_dist
-        crew = supabase.table("crews").select(
-            "fuel_consumption_city,fuel_consumption_highway,fuel_type"
-        ).eq("id", shift["crew_id"]).execute().data[0]
-        rate = crew["fuel_consumption_city"]
-        fuel_used = float(shift.get("fuel_used") or 0) + (total_dist * rate / 100)
+        fuel_used = float(shift.get("fuel_used") or 0) + total_fuel
         price_result = supabase.table("fuel_prices").select("price_per_liter")\
             .eq("fuel_type", crew["fuel_type"]).order("valid_from", desc=True).limit(1).execute()
         price = float(price_result.data[0]["price_per_liter"]) if price_result.data else 245.0
@@ -306,8 +369,8 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
     return {"status": "ok", "saved": len(rows)}
 
 @app.get("/gps/track/{crew_id}")
-def get_crew_track(crew_id: str, shift_date: str = None):
-    target_date = shift_date or date.today().isoformat()
+def get_crew_track(crew_id: str, shift_date: str = None, admin=Depends(require_admin)):
+    target_date = shift_date or today_kz()
     shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
     if not shift.data:
         return []
@@ -318,8 +381,8 @@ def get_crew_track(crew_id: str, shift_date: str = None):
 # ─── ТОЧКИ ОСТАНОВОК ─────────────────────────────────────────────
 
 @app.get("/stops/{crew_id}")
-def get_stops(crew_id: str, shift_date: str = None):
-    target_date = shift_date or date.today().isoformat()
+def get_stops(crew_id: str, shift_date: str = None, admin=Depends(require_admin)):
+    target_date = shift_date or today_kz()
     shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
     if not shift.data:
         return []
@@ -336,7 +399,7 @@ class StopPoint(BaseModel):
 
 @app.post("/stops/add")
 def add_stop(req: StopPoint, employee=Depends(get_current_employee)):
-    today = date.today().isoformat()
+    today = today_kz()
     shift_result = supabase.table("shifts").select("*")\
         .eq("employee_id", employee["id"]).eq("date", today)\
         .in_("status", ["active", "break", "tech"]).execute()
@@ -345,7 +408,7 @@ def add_stop(req: StopPoint, employee=Depends(get_current_employee)):
     shift = shift_result.data[0]
 
     stop_count = supabase.table("stop_points").select("id").eq("shift_id", shift["id"]).execute()
-    label = STOP_LABELS[len(stop_count.data) % len(STOP_LABELS)]
+    label = stop_label(len(stop_count.data))
     address = req.address if req.address else get_address(req.lat, req.lng)
 
     supabase.table("stop_points").insert({
@@ -359,9 +422,10 @@ def add_stop(req: StopPoint, employee=Depends(get_current_employee)):
 # ─── ДАШБОРД ─────────────────────────────────────────────────────
 
 @app.get("/dashboard/live")
-def get_live_dashboard():
-    today = date.today().isoformat()
+def get_live_dashboard(admin=Depends(require_admin)):
+    today = today_kz()
     crews = supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute().data
+    crews = sanitize_crews(crews)
     result = []
     for crew in crews:
         shifts = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew["id"]).eq("date", today).execute().data
@@ -380,7 +444,7 @@ def get_live_dashboard():
 # ─── ОТЧЁТЫ ──────────────────────────────────────────────────────
 
 @app.get("/reports/summary")
-def get_report(date_from: str, date_to: str, crew_id: str = None):
+def get_report(date_from: str, date_to: str, crew_id: str = None, admin=Depends(require_admin)):
     query = supabase.table("shifts").select("*, crews(name, car_brand, car_model), employees(full_name)")\
         .gte("date", date_from).lte("date", date_to)
     if crew_id:
@@ -394,15 +458,15 @@ class FuelPriceUpdate(BaseModel):
     price_per_liter: float
 
 @app.post("/fuel-prices")
-def update_fuel_price(req: FuelPriceUpdate):
+def update_fuel_price(req: FuelPriceUpdate, admin=Depends(require_admin)):
     supabase.table("fuel_prices").insert({
         "fuel_type": req.fuel_type, "price_per_liter": req.price_per_liter,
-        "valid_from": date.today().isoformat()
+        "valid_from": today_kz()
     }).execute()
     return {"message": "Цена обновлена"}
 
 @app.get("/fuel-prices")
-def get_fuel_prices():
+def get_fuel_prices(admin=Depends(require_admin)):
     return supabase.table("fuel_prices").select("*").order("valid_from", desc=True).execute().data
 
 @app.get("/")
