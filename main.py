@@ -257,7 +257,10 @@ def shift_action(req: ShiftAction, employee=Depends(get_current_employee)):
     return {"message": f"Статус обновлён: {new_status}"}
 
 @app.get("/shifts/today/{crew_id}")
-def get_today_shifts(crew_id: str, admin=Depends(require_admin)):
+def get_today_shifts(crew_id: str):
+    # Мобилка вызывает это без заголовка авторизации, чтобы восстановить
+    # статус смены при открытии приложения — не требуем auth (только для
+    # дашборда используется require_admin, но здесь дашборд не ходит).
     today = today_kz()
     result = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew_id).eq("date", today).execute()
     return result.data
@@ -381,7 +384,8 @@ def get_crew_track(crew_id: str, shift_date: str = None, admin=Depends(require_a
 # ─── ТОЧКИ ОСТАНОВОК ─────────────────────────────────────────────
 
 @app.get("/stops/{crew_id}")
-def get_stops(crew_id: str, shift_date: str = None, admin=Depends(require_admin)):
+def get_stops(crew_id: str, shift_date: str = None):
+    # Тоже вызывается мобилкой без заголовка авторизации (см. /shifts/today).
     target_date = shift_date or today_kz()
     shift = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).limit(1).execute()
     if not shift.data:
