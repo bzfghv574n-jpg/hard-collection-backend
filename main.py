@@ -464,15 +464,42 @@ def get_live_dashboard(admin=Depends(require_admin)):
     today = today_kz()
     crews = supabase.table("crews").select("*, crew_members(*, employees(*))").eq("is_active", True).execute().data
     crews = sanitize_crews(crews)
+    crew_ids = [c["id"] for c in crews]
+    if not crew_ids:
+        return []
+
+    # Раньше это было 3 запроса НА КАЖДЫЙ экипаж в цикле (90 запросов при 30
+    # экипажах на один вызов дашборда) — сводим к нескольким пакетным запросам
+    # независимо от числа экипажей.
+    all_shifts = supabase.table("shifts").select("*, employees(full_name)")\
+        .in_("crew_id", crew_ids).eq("date", today).execute().data
+    shifts_by_crew = {}
+    for s in all_shifts:
+        shifts_by_crew.setdefault(s["crew_id"], []).append(s)
+
+    # PostgREST не поддерживает "DISTINCT ON" через клиентскую библиотеку —
+    # берём достаточно большое окно последних точек/остановок по всем экипажам
+    # и группируем "первую на каждый crew_id" в Python (точки уже отсортированы
+    # по убыванию времени, так что первая встреченная — самая свежая).
+    recent_points = supabase.table("gps_tracks").select("crew_id,lat,lng,recorded_at")\
+        .in_("crew_id", crew_ids).order("recorded_at", desc=True).limit(len(crew_ids) * 20).execute().data
+    last_point_by_crew = {}
+    for p in recent_points:
+        last_point_by_crew.setdefault(p["crew_id"], p)
+
+    recent_stops = supabase.table("stop_points").select("*")\
+        .in_("crew_id", crew_ids).order("arrived_at", desc=True).limit(len(crew_ids) * 10).execute().data
+    last_stop_by_crew = {}
+    for s in recent_stops:
+        last_stop_by_crew.setdefault(s["crew_id"], s)
+
     result = []
     for crew in crews:
-        shifts = supabase.table("shifts").select("*, employees(full_name)").eq("crew_id", crew["id"]).eq("date", today).execute().data
-        last_point = supabase.table("gps_tracks").select("lat,lng,recorded_at").eq("crew_id", crew["id"]).order("recorded_at", desc=True).limit(1).execute().data
-        stops = supabase.table("stop_points").select("*").eq("crew_id", crew["id"]).order("arrived_at", desc=True).limit(1).execute().data
+        shifts = shifts_by_crew.get(crew["id"], [])
         result.append({
             "crew": crew, "shifts": shifts,
-            "last_position": last_point[0] if last_point else None,
-            "current_stop": stops[0] if stops else None,
+            "last_position": last_point_by_crew.get(crew["id"]),
+            "current_stop": last_stop_by_crew.get(crew["id"]),
             "total_km": sum(float(s.get("total_km") or 0) for s in shifts),
             "total_fuel": sum(float(s.get("fuel_used") or 0) for s in shifts),
             "total_cost": sum(float(s.get("fuel_cost") or 0) for s in shifts),

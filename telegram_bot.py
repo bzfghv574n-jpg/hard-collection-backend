@@ -259,6 +259,20 @@ async def auto_finish_shifts(app):
             )
             await send_notification(app, msg)
 
+GPS_TRACK_RETENTION_DAYS = 40
+
+async def cleanup_old_gps_tracks(app):
+    # Сырые GPS-точки — главный пожиратель места в базе при большом парке
+    # машин. Итоги смены (пробег/расход/стоимость) хранятся отдельно в
+    # shifts и не зависят от наличия старых точек — можно спокойно чистить.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=GPS_TRACK_RETENTION_DAYS)).isoformat()
+    try:
+        result = supabase.table("gps_tracks").delete().lt("recorded_at", cutoff).execute()
+        deleted = len(result.data or [])
+        logger.info(f"Очистка GPS-точек старше {GPS_TRACK_RETENTION_DAYS} дней: удалено {deleted}")
+    except Exception as e:
+        logger.error(f"Ошибка очистки старых GPS-точек: {e}")
+
 async def check_long_stops(app):
     now = now_local()
     today = now.date().isoformat()
@@ -369,6 +383,8 @@ async def scheduler(app):
                     await check_incomplete_crews(app)
                 if now.hour == 23 and now.minute == 50:
                     await auto_finish_shifts(app)
+                if now.hour == 4 and now.minute == 0:
+                    await cleanup_old_gps_tracks(app)
         except Exception as e:
             logger.error(f"Ошибка планировщика: {e}")
         await asyncio.sleep(30)
