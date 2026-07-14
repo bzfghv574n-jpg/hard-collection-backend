@@ -301,6 +301,12 @@ class GpsPoint(BaseModel):
     lng: float
     speed: float = 0.0
     distance_km: float = 0.0  # считается на мобилке, только при speed >= 15 км/ч
+    recorded_at: str = None  # реальное время фиксации на телефоне (не время получения сервером!)
+                              # — критично при батч-отправке: без этого все точки батча
+                              # получают ПОЧТИ ОДИНАКОВЫЙ recorded_at (время INSERT в базу),
+                              # и любой анализ по интервалам между точками (например, фильтр
+                              # GPS-скачков в дашборде, считающий скорость=расстояние/время)
+                              # ломается — секунды между точками ≈0 → скорость ≈∞.
 
 def _fuel_rate_for(crew: dict, speed: float) -> float:
     # Расход: трасса если > 80 км/ч, иначе город
@@ -318,11 +324,12 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
 
     shift = shift_result.data[0]
 
-    # Сохраняем точку
+    # Сохраняем точку — recorded_at берём с телефона, если он его прислал
+    # (см. комментарий в GpsPoint), иначе — время сервера как раньше.
     supabase.table("gps_tracks").insert({
         "shift_id": shift["id"], "crew_id": shift["crew_id"],
         "lat": point.lat, "lng": point.lng, "speed": point.speed,
-        "recorded_at": datetime.utcnow().isoformat()
+        "recorded_at": point.recorded_at or datetime.utcnow().isoformat()
     }).execute()
 
     # Обновляем пробег только если мобилка прислала реальное расстояние
@@ -369,7 +376,10 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
         rows.append({
             "shift_id": shift["id"], "crew_id": shift["crew_id"],
             "lat": point.lat, "lng": point.lng, "speed": point.speed,
-            "recorded_at": datetime.utcnow().isoformat()
+            # Критично для батчей: без recorded_at с телефона все точки одного
+            # батча получили бы почти одинаковое время (момент INSERT), а не
+            # реальные интервалы между GPS-фиксами.
+            "recorded_at": point.recorded_at or datetime.utcnow().isoformat()
         })
         if point.distance_km > 0:
             total_dist += point.distance_km
