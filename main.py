@@ -8,6 +8,7 @@ from datetime import datetime, date, timezone, timedelta
 import os, hashlib, secrets
 
 from geocoding import get_address
+from crew_presence import classify_crew_presence
 
 load_dotenv()
 
@@ -415,13 +416,24 @@ def get_crew_track(crew_id: str, shift_date: str = None, admin=Depends(require_a
     # обед и т.п.) — если брать только одну смену (.limit(1), без сортировки),
     # можно тихо показать трек СТАРОЙ смены и потерять текущую. Объединяем
     # точки со всех смен этого дня.
-    shifts = supabase.table("shifts").select("id").eq("crew_id", crew_id).eq("date", target_date).execute().data
+    shifts = supabase.table("shifts").select("id, employee_id, employees(full_name)")\
+        .eq("crew_id", crew_id).eq("date", target_date).execute().data
     if not shifts:
         return []
     shift_ids = [s["id"] for s in shifts]
-    tracks = supabase.table("gps_tracks").select("lat,lng,speed,recorded_at")\
-        .in_("shift_id", shift_ids).order("recorded_at").execute()
-    return tracks.data
+    # employee_id/full_name на каждую точку — нужно дашборду, чтобы разделить
+    # треки по сотрудникам, когда экипаж "разошёлся" (см. crew_presence.py).
+    employee_by_shift = {
+        s["id"]: {"employee_id": s["employee_id"], "full_name": (s.get("employees") or {}).get("full_name")}
+        for s in shifts
+    }
+    tracks = supabase.table("gps_tracks").select("lat,lng,speed,recorded_at,shift_id")\
+        .in_("shift_id", shift_ids).order("recorded_at").execute().data
+    for t in tracks:
+        emp = employee_by_shift.get(t["shift_id"], {})
+        t["employee_id"] = emp.get("employee_id")
+        t["full_name"] = emp.get("full_name")
+    return tracks
 
 # ─── ТОЧКИ ОСТАНОВОК ─────────────────────────────────────────────
 
@@ -491,11 +503,27 @@ def get_live_dashboard(admin=Depends(require_admin)):
     # берём достаточно большое окно последних точек/остановок по всем экипажам
     # и группируем "первую на каждый crew_id" в Python (точки уже отсортированы
     # по убыванию времени, так что первая встреченная — самая свежая).
+    # Запасной вариант для метки на карте, если сейчас нет ни одной активной
+    # смены (экипаж офлайн или уже завершил день) — тогда сравнивать "вместе
+    # или врозь" не с чем, просто показываем где были в последний раз.
     recent_points = supabase.table("gps_tracks").select("crew_id,lat,lng,recorded_at")\
         .in_("crew_id", crew_ids).order("recorded_at", desc=True).limit(len(crew_ids) * 20).execute().data
     last_point_by_crew = {}
     for p in recent_points:
         last_point_by_crew.setdefault(p["crew_id"], p)
+
+    # Последняя точка НА КАЖДУЮ активную смену (не на экипаж целиком) — нужна,
+    # чтобы понять, где сейчас каждый конкретный сотрудник экипажа, и сравнить
+    # их между собой (см. crew_presence.py: "вместе в одной машине" или
+    # "разошлись — один не на рабочем месте").
+    active_shift_ids = [s["id"] for s in all_shifts if s["status"] in ("active", "break", "tech")]
+    last_point_by_shift = {}
+    if active_shift_ids:
+        recent_shift_points = supabase.table("gps_tracks").select("shift_id,lat,lng,recorded_at")\
+            .in_("shift_id", active_shift_ids).order("recorded_at", desc=True)\
+            .limit(len(active_shift_ids) * 20).execute().data
+        for p in recent_shift_points:
+            last_point_by_shift.setdefault(p["shift_id"], p)
 
     recent_stops = supabase.table("stop_points").select("*")\
         .in_("crew_id", crew_ids).order("arrived_at", desc=True).limit(len(crew_ids) * 10).execute().data
@@ -506,13 +534,70 @@ def get_live_dashboard(admin=Depends(require_admin)):
     result = []
     for crew in crews:
         shifts = shifts_by_crew.get(crew["id"], [])
+        finished = [s for s in shifts if s["status"] == "finished"]
+        active = [s for s in shifts if s["status"] in ("active", "break", "tech")]
+
+        # Пробег/расход уже завершённых сегодня смен этого экипажа — это
+        # прошлое, они не могут "конфликтовать" ни с кем прямо сейчас,
+        # суммируем как раньше.
+        finished_km = sum(float(s.get("total_km") or 0) for s in finished)
+        finished_fuel = sum(float(s.get("fuel_used") or 0) for s in finished)
+        finished_cost = sum(float(s.get("fuel_cost") or 0) for s in finished)
+
+        active_with_points = [{"shift": s, "last_point": last_point_by_shift.get(s["id"])} for s in active]
+        presence = classify_crew_presence(active_with_points)
+
+        last_position = last_point_by_crew.get(crew["id"])
+        active_detail = None
+
+        if presence["state"] == "divergent":
+            # Сотрудники сейчас в разных местах — нет единого "пробега
+            # экипажа", который можно было бы честно посчитать одним числом
+            # (мы не знаем, кто из них в машине, а кто по своим делам).
+            # Отдаём раздельно по сотруднику, дашборд покажет обе линии на
+            # карте с предупреждением вместо того, чтобы гадать.
+            active_detail = [
+                {
+                    "shift_id": s["id"],
+                    "employee_id": s["employee_id"],
+                    "full_name": (s.get("employees") or {}).get("full_name"),
+                    "total_km": float(s.get("total_km") or 0),
+                    "fuel_used": float(s.get("fuel_used") or 0),
+                    "fuel_cost": float(s.get("fuel_cost") or 0),
+                    "last_point": last_point_by_shift.get(s["id"]),
+                }
+                for s in active
+            ]
+            total_km, total_fuel, total_cost = finished_km, finished_fuel, finished_cost
+        else:
+            # solo (0-1 активных) или together (несколько, но в одной
+            # машине) — берём ОДНУ смену-"победителя" (максимум пробега:
+            # см. classify_crew_presence) вместо суммы по всем активным,
+            # иначе одновременная работа 2 телефонов задваивала бы пробег
+            # и расход топлива на ровном месте.
+            primary_shift = None
+            if presence["primary_shift_id"]:
+                primary_shift = next((s for s in active if s["id"] == presence["primary_shift_id"]), None)
+            if primary_shift:
+                last_position = last_point_by_shift.get(primary_shift["id"]) or last_position
+                total_km = finished_km + float(primary_shift.get("total_km") or 0)
+                total_fuel = finished_fuel + float(primary_shift.get("fuel_used") or 0)
+                total_cost = finished_cost + float(primary_shift.get("fuel_cost") or 0)
+            else:
+                total_km, total_fuel, total_cost = finished_km, finished_fuel, finished_cost
+
         result.append({
             "crew": crew, "shifts": shifts,
-            "last_position": last_point_by_crew.get(crew["id"]),
+            "presence_state": presence["state"],
+            # Кого показывать на карте одной линией при solo/together (null
+            # при divergent — там дашборд рисует обе линии по active_detail).
+            "primary_shift_id": presence["primary_shift_id"] if presence["state"] != "divergent" else None,
+            "active_detail": active_detail,
+            "last_position": last_position,
             "current_stop": last_stop_by_crew.get(crew["id"]),
-            "total_km": sum(float(s.get("total_km") or 0) for s in shifts),
-            "total_fuel": sum(float(s.get("fuel_used") or 0) for s in shifts),
-            "total_cost": sum(float(s.get("fuel_cost") or 0) for s in shifts),
+            "total_km": round(total_km, 3),
+            "total_fuel": round(total_fuel, 3),
+            "total_cost": round(total_cost, 2),
         })
     return result
 

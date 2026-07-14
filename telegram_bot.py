@@ -9,6 +9,7 @@ from supabase import create_client, Client
 from geopy.distance import geodesic
 
 from geocoding import get_address
+from crew_presence import classify_crew_presence
 
 load_dotenv()
 
@@ -362,6 +363,84 @@ async def check_incomplete_crews(app):
                 msg = f"\u26a0\ufe0f *Неполный состав*\n\nЭкипаж *{crew_name}* движется, но не все нажали Начать смену.\nНа линии: {len(shifts)} из {member_count}"
                 await send_notification(app, msg, notif["id"])
 
+# crew_id -> когда впервые замечено расхождение (UTC). Хранится в памяти
+# процесса — при рестарте бота обнуляется, это ок: просто ещё раз подождём
+# DIVERGENCE_DEBOUNCE_MINUTES перед первым уведомлением после рестарта.
+_pending_divergence = {}
+DIVERGENCE_DEBOUNCE_MINUTES = 8  # ~2 проверки шедулера подряд — не поднимаем тревогу на единичный GPS-скачок
+
+async def check_crew_diverged(app):
+    now_utc = datetime.now(timezone.utc)
+    today = now_local().date().isoformat()
+    crews = supabase.table("crews").select("*, crew_members(*)").eq("is_active", True).execute().data
+    seen_crew_ids = set()
+    for crew in crews:
+        member_count = len(crew.get("crew_members", []))
+        if member_count < 2:
+            continue
+        seen_crew_ids.add(crew["id"])
+
+        shifts = supabase.table("shifts").select("*, employees(full_name)")\
+            .eq("crew_id", crew["id"]).eq("date", today)\
+            .in_("status", ["active", "break", "tech"]).execute().data
+        if len(shifts) < 2:
+            _pending_divergence.pop(crew["id"], None)
+            continue
+
+        shift_ids = [s["id"] for s in shifts]
+        recent_points = supabase.table("gps_tracks").select("shift_id,lat,lng,recorded_at")\
+            .in_("shift_id", shift_ids).order("recorded_at", desc=True)\
+            .limit(len(shift_ids) * 20).execute().data
+        last_point_by_shift = {}
+        for p in recent_points:
+            last_point_by_shift.setdefault(p["shift_id"], p)
+
+        active_with_points = [{"shift": s, "last_point": last_point_by_shift.get(s["id"])} for s in shifts]
+        presence = classify_crew_presence(active_with_points)
+
+        if presence["state"] != "divergent":
+            _pending_divergence.pop(crew["id"], None)
+            continue
+
+        first_seen = _pending_divergence.get(crew["id"])
+        if first_seen is None:
+            _pending_divergence[crew["id"]] = now_utc
+            continue  # первое обнаружение — ждём подтверждения на следующей проверке, не поднимаем тревогу сразу
+        if (now_utc - first_seen).total_seconds() / 60 < DIVERGENCE_DEBOUNCE_MINUTES:
+            continue
+
+        existing = supabase.table("notifications").select("*")\
+            .eq("crew_id", crew["id"]).eq("type", "crew_diverged")\
+            .gte("created_at", today).execute()
+        if existing.data:
+            last_notif_time = datetime.fromisoformat(existing.data[-1]["created_at"].replace("Z", "+00:00"))
+            if (now_utc - last_notif_time).total_seconds() < 7200:  # не чаще раза в 2 часа, пока не сошлись обратно
+                continue
+
+        lines = []
+        for cluster in presence["clusters"]:
+            shift = next(s for s in shifts if s["id"] == cluster[0])
+            point = last_point_by_shift.get(shift["id"])
+            name = (shift.get("employees") or {}).get("full_name") or "?"
+            addr = get_address(point["lat"], point["lng"]) if point else "координаты неизвестны"
+            lines.append(f"\U0001f4cd {name}: {addr}")
+
+        notif = supabase.table("notifications").insert({
+            "type": "crew_diverged", "crew_id": crew["id"], "message": "Экипаж разошёлся"
+        }).execute().data[0]
+        crew_name = crew["name"]
+        msg = (
+            f"⚠️ *Экипаж разошёлся*\n\n"
+            f"Экипаж *{crew_name}* — сотрудники в разных местах. Возможно, кто-то не на рабочем месте.\n\n"
+            + "\n".join(lines)
+        )
+        await send_notification(app, msg, notif["id"])
+
+    # Экипажи, которых не проверяли в этот раз (архивированы и т.п.) — чистим debounce-словарь
+    for crew_id in list(_pending_divergence.keys()):
+        if crew_id not in seen_crew_ids:
+            _pending_divergence.pop(crew_id, None)
+
 async def scheduler(app):
     logger.info("Планировщик запущен")
     last_minute = -1
@@ -381,6 +460,8 @@ async def scheduler(app):
                     await check_long_stops(app)
                 if now.minute % 5 == 0:
                     await check_incomplete_crews(app)
+                if now.minute % 5 == 0:
+                    await check_crew_diverged(app)
                 if now.hour == 23 and now.minute == 50:
                     await auto_finish_shifts(app)
                 if now.hour == 4 and now.minute == 0:
