@@ -427,13 +427,24 @@ def get_crew_track(crew_id: str, shift_date: str = None, admin=Depends(require_a
         s["id"]: {"employee_id": s["employee_id"], "full_name": (s.get("employees") or {}).get("full_name")}
         for s in shifts
     }
-    # Supabase/PostgREST молча обрезает результат до 1000 строк без явного
-    # limit — при долгой смене (14ч, точка каждые 5-8 сек) один экипаж легко
-    # даёт больше 1000 точек в день, и без этого лимита конец трека (самые
-    # свежие точки!) тихо пропадал бы с карты. Обнаружено на тесте с 2
-    # одновременными сменами, где суммарно вышло 1000+ точек за день.
-    tracks = supabase.table("gps_tracks").select("lat,lng,speed,recorded_at,shift_id")\
-        .in_("shift_id", shift_ids).order("recorded_at").limit(50000).execute().data
+    # У PostgREST есть ЖЁСТКИЙ серверный потолок в 1000 строк на запрос
+    # (db-max-rows) — обычный .limit() с клиента его не обходит. При долгой
+    # смене (14ч, точка каждые 5-8 сек) один экипаж легко даёт больше 1000
+    # точек в день, и без пагинации терялся именно конец трека (самые свежие
+    # точки!). Обнаружено на тесте с 2 одновременными сменами, где суммарно
+    # вышло 1000+ точек за день. Тянем страницами по .range(), пока страница
+    # не окажется неполной.
+    tracks = []
+    PAGE = 1000
+    offset = 0
+    while True:
+        page = supabase.table("gps_tracks").select("lat,lng,speed,recorded_at,shift_id")\
+            .in_("shift_id", shift_ids).order("recorded_at")\
+            .range(offset, offset + PAGE - 1).execute().data
+        tracks.extend(page)
+        if len(page) < PAGE:
+            break
+        offset += PAGE
     for t in tracks:
         emp = employee_by_shift.get(t["shift_id"], {})
         t["employee_id"] = emp.get("employee_id")
