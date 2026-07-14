@@ -313,6 +313,23 @@ def _fuel_rate_for(crew: dict, speed: float) -> float:
     # Расход: трасса если > 80 км/ч, иначе город
     return crew["fuel_consumption_highway"] if speed > 80 else crew["fuel_consumption_city"]
 
+def ensure_start_point(shift: dict, lat: float, lng: float, recorded_at: str = None):
+    # Единообразно для ВСЕХ экипажей: самая первая GPS-точка смены отмечается
+    # как "Точка A" — начало маршрута, а не только точки реальных остановок
+    # (те приходят отдельно через /stops/add). Проверяем по наличию хоть одной
+    # stop_points у этой смены — если уже есть (в т.ч. эта же "A"), ничего не
+    # делаем, так что срабатывает ровно один раз за смену.
+    existing = supabase.table("stop_points").select("id").eq("shift_id", shift["id"]).limit(1).execute()
+    if existing.data:
+        return
+    address = get_address(lat, lng)
+    supabase.table("stop_points").insert({
+        "shift_id": shift["id"], "crew_id": shift["crew_id"],
+        "lat": lat, "lng": lng, "address": address,
+        "point_label": "A", "arrived_at": recorded_at or datetime.utcnow().isoformat(),
+        "duration_minutes": 0,
+    }).execute()
+
 @app.post("/gps/track")
 def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
     today = today_kz()
@@ -332,6 +349,8 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
         "lat": point.lat, "lng": point.lng, "speed": point.speed,
         "recorded_at": point.recorded_at or datetime.utcnow().isoformat()
     }).execute()
+
+    ensure_start_point(shift, point.lat, point.lng, point.recorded_at)
 
     # Обновляем пробег только если мобилка прислала реальное расстояние
     if point.distance_km > 0:
@@ -393,6 +412,9 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
 
     if rows:
         supabase.table("gps_tracks").insert(rows).execute()
+        # Первая точка батча — самая ранняя (мобилка копит их по порядку) —
+        # если у смены ещё нет ни одной stop_points, отмечаем её как "Точка A".
+        ensure_start_point(shift, points[0].lat, points[0].lng, points[0].recorded_at)
 
     if total_dist > 0:
         new_km = float(shift.get("total_km") or 0) + total_dist
