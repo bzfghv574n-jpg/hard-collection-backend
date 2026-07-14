@@ -649,6 +649,22 @@ def get_report(date_from: str, date_to: str, crew_id: str = None, admin=Depends(
         query = query.eq("crew_id", crew_id)
     return query.execute().data
 
+# ─── УВЕДОМЛЕНИЯ ─────────────────────────────────────────────────
+# Диагностика того, что реально отправил (или собирался отправить) Telegram-
+# бот — без передачи TELEGRAM_BOT_TOKEN куда-либо. telegram_bot.py пишет сюда
+# запись ПЕРЕД отправкой сообщения (см. send_notification в telegram_bot.py),
+# так что эта таблица — надёжный журнал сработавших условий, даже если сам
+# Telegram недоступен для просмотра.
+
+@app.get("/notifications")
+def get_notifications(crew_id: str = None, since: str = None, limit: int = 100, admin=Depends(require_admin)):
+    query = supabase.table("notifications").select("*, crews(name)").order("created_at", desc=True)
+    if crew_id:
+        query = query.eq("crew_id", crew_id)
+    if since:
+        query = query.gte("created_at", since)
+    return query.limit(min(limit, 500)).execute().data
+
 # ─── ЦЕНЫ ТОПЛИВА ────────────────────────────────────────────────
 
 class FuelPriceUpdate(BaseModel):
