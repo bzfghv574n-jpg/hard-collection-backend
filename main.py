@@ -22,6 +22,7 @@ app = FastAPI(title="Hard Collection API")
 ALLOWED_ORIGINS = [
     "https://hard-collection-dashboard-production.up.railway.app",
     "http://localhost:3000",
+    "http://localhost:8090",  # TEMP: скриншот мобилки через expo web-превью для презентации, убрать после
 ]
 
 app.add_middleware(
