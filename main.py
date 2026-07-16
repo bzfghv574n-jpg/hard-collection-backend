@@ -657,12 +657,14 @@ def get_report(date_from: str, date_to: str, crew_id: str = None, admin=Depends(
 # Telegram недоступен для просмотра.
 
 @app.get("/notifications")
-def get_notifications(crew_id: str = None, since: str = None, limit: int = 100, admin=Depends(require_admin)):
+def get_notifications(crew_id: str = None, since: str = None, until: str = None, limit: int = 100, admin=Depends(require_admin)):
     query = supabase.table("notifications").select("*, crews(name)").order("created_at", desc=True)
     if crew_id:
         query = query.eq("crew_id", crew_id)
     if since:
         query = query.gte("created_at", since)
+    if until:
+        query = query.lte("created_at", until)
     return query.limit(min(limit, 500)).execute().data
 
 # ─── ЦЕНЫ ТОПЛИВА ────────────────────────────────────────────────
