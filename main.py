@@ -313,6 +313,13 @@ def _fuel_rate_for(crew: dict, speed: float) -> float:
     # Расход: трасса если > 80 км/ч, иначе город
     return crew["fuel_consumption_highway"] if speed > 80 else crew["fuel_consumption_city"]
 
+# Голый расчёт "пробег × паспортный расход" не учитывает пробки, прогрев
+# двигателя и т.п. — в реальности расход всегда чуть выше. Простая фиксированная
+# наценка на весь расчётный расход смены (не привязана к конкретному участку
+# пути — по просьбе пользователя выбран самый простой вариант вместо более
+# точного, но сложного варианта с отдельной ставкой для пробок/прогрева).
+FUEL_BUFFER_MULTIPLIER = 1.10
+
 def ensure_start_point(shift: dict, lat: float, lng: float, recorded_at: str = None):
     # Единообразно для ВСЕХ экипажей: самая первая GPS-точка смены отмечается
     # как "Точка A" — начало маршрута, а не только точки реальных остановок
@@ -360,7 +367,7 @@ def add_gps_point(point: GpsPoint, employee=Depends(get_current_employee)):
         ).eq("id", shift["crew_id"]).execute().data[0]
 
         rate = _fuel_rate_for(crew, point.speed)
-        fuel_used = float(shift.get("fuel_used") or 0) + (point.distance_km * rate / 100)
+        fuel_used = float(shift.get("fuel_used") or 0) + (point.distance_km * rate / 100 * FUEL_BUFFER_MULTIPLIER)
 
         price_result = supabase.table("fuel_prices").select("price_per_liter")\
             .eq("fuel_type", crew["fuel_type"]).order("valid_from", desc=True).limit(1).execute()
@@ -408,7 +415,7 @@ def add_gps_batch(points: list[GpsPoint], employee=Depends(get_current_employee)
                     "fuel_consumption_city,fuel_consumption_highway,fuel_type"
                 ).eq("id", shift["crew_id"]).execute().data[0]
             rate = _fuel_rate_for(crew, point.speed)
-            total_fuel += point.distance_km * rate / 100
+            total_fuel += point.distance_km * rate / 100 * FUEL_BUFFER_MULTIPLIER
 
     if rows:
         supabase.table("gps_tracks").insert(rows).execute()
